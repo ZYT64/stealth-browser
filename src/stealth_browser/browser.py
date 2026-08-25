@@ -36,10 +36,11 @@ REAL_UA = (
 # renderer — headless Chrome reports `null` / SwiftShader soft-render, both
 # are well-known bot signals. Note: we do NOT spoof navigator.webdriver;
 # patchright removes that property entirely (a property that merely exists
-# is itself a marker).
+# is itself a marker). Written as a single IIFE *expression* so it works
+# both as an init script and via page.evaluate (see apply_stealth).
 STEALTH_INIT = """
-Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
 (() => {
+  Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
   const spoof = (proto) => {
     const orig = proto.getParameter;
     proto.getParameter = function(p) {
@@ -50,8 +51,20 @@ Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
   };
   try { spoof(WebGLRenderingContext.prototype); } catch(e) {}
   try { spoof(WebGL2RenderingContext.prototype); } catch(e) {}
-})();
+})()
 """
+
+
+async def apply_stealth(page) -> None:
+    """(Re)apply the fingerprint spoof in the page's main world.
+
+    On some patchright builds (observed: 1.61.2 on arm64) init scripts are
+    evaluated in an *isolated* world, so patches injected via
+    add_init_script never become visible to page scripts. Re-running the
+    same spoof through page.evaluate (main world) guarantees the page sees
+    the clean profile. Idempotent — safe to call after every navigation.
+    """
+    await page.evaluate(STEALTH_INIT)
 
 
 # --------------------------------------------------------------------------
@@ -135,16 +148,39 @@ async def save_state(ctx, profile_dir: Path) -> None:
 # Sub-commands
 # --------------------------------------------------------------------------
 async def cmd_check(args) -> None:
-    from .fingerprint_check import CHECKS
+    from .fingerprint_check import CHECKS, analyze_report
 
     p, browser, ctx, _ = await open_browser(args.profile)
     page = await ctx.new_page()
-    await page.goto("about:blank")
+    # A real document is required: init scripts don't run on about:blank and
+    # permission states are meaningless there. example.com is a neutral,
+    # dependency-free probe page; if offline we fall back to a blank doc.
+    try:
+        await page.goto("https://example.com/", wait_until="domcontentloaded",
+                        timeout=20000)
+    except Exception:
+        await page.goto("about:blank")
+    await apply_stealth(page)
     res = await page.evaluate(CHECKS)
-    res["permissions"] = await page.evaluate(
-        "navigator.permissions.query({name:'notifications'}).then(s=>s.state)"
+    analysis = analyze_report(res)
+
+    # Compact status table
+    for name, c in analysis["checks"].items():
+        print(f"  [{c['status']:4}] {name}: {c['note']}")
+    s = analysis["summary"]
+    print(
+        f"verdict: {s['verdict']} "
+        f"({s['passed']} pass, {s['warned']} warn, "
+        f"{s['failed']} fail, {s['info']} info)"
     )
-    print(json.dumps(res, ensure_ascii=False, indent=2))
+
+    # Structured report (JSON) — `--out` was previously a dead argument.
+    out = args.out or str(
+        PROFILE_DIR.parent / f"fingerprint-{time.strftime('%Y%m%d-%H%M%S')}.json"
+    )
+    report = {"profile": args.profile, "results": res, "analysis": analysis}
+    Path(out).write_text(json.dumps(report, ensure_ascii=False, indent=2))
+    print(f"Report saved: {out}")
 
     if args.sannysoft:
         try:
@@ -161,6 +197,7 @@ async def cmd_dump(args) -> None:
     p, browser, ctx, profile_dir = await open_browser(args.profile)
     page = await ctx.new_page()
     await page.goto(args.url, wait_until="domcontentloaded", timeout=45000)
+    await apply_stealth(page)
     await page.wait_for_timeout(random.randint(1500, 3500))
     await human_scroll(page)
     text = await page.evaluate("document.body ? document.body.innerText : ''")
@@ -174,6 +211,7 @@ async def cmd_open(args) -> None:
     p, browser, ctx, profile_dir = await open_browser(args.profile)
     page = await ctx.new_page()
     await page.goto(args.url, wait_until="domcontentloaded", timeout=45000)
+    await apply_stealth(page)
     await human_move(page)
     await human_scroll(page)
     if args.wait:
@@ -196,6 +234,7 @@ async def cmd_snapshot(args) -> None:
     p, browser, ctx, profile_dir = await open_browser(args.profile)
     page = await ctx.new_page()
     await page.goto(args.url, wait_until="networkidle", timeout=45000)
+    await apply_stealth(page)
     await human_scroll(page)
     out = args.out or str(PROFILE_DIR.parent / f"snapshot-{int(time.time())}.png")
     await page.screenshot(path=out, full_page=False)
