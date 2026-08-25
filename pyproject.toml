@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stealth-browser"
+version = "0.1.0"
+description = "Human-like, anti-fingerprint browser automation toolkit (patchright + Chromium). Avoid bot detection with natural delays, scrolling, mouse paths, and fingerprint spoofing."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "ZYT64" }]
+keywords = ["browser-automation", "anti-detect", "patchright", "stealth", "fingerprint", "playwright"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Internet :: WWW/HTTP :: Browsers",
+]
+
+[project.optional-dependencies]
+# patchright is the anti-detection fork of Playwright
+core = ["patchright>=1.61"]
+# Deprecated/legacy Playwright (not recommended — leaks webdriver)
+playwright = ["playwright"]
+
+[project.scripts]
+stealth-browser = "stealth_browser.browser:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
