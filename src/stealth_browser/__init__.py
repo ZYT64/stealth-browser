@@ -1,6 +1,7 @@
 """stealth-browser: human-like, anti-fingerprint browser automation."""
 
 from .browser import (
+    apply_stealth,
     open_browser,
     human_delay,
     human_scroll,
@@ -8,8 +9,9 @@ from .browser import (
     human_type,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = [
+    "apply_stealth",
     "open_browser",
     "human_delay",
     "human_scroll",
