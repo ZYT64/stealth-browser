@@ -60,6 +60,9 @@ pip install -e ".[core]"
 # 1. Verify the anti-fingerprint profile (local checks)
 stealth-browser check
 
+# JSON report written to a custom path (default: ~/.stealth-browser/fingerprint-*.json)
+stealth-browser check --out /tmp/report.json
+
 # 2. Verify against bot.sannysoft.com (remote scan, 27 checks)
 stealth-browser check sannysoft
 
@@ -77,12 +80,13 @@ stealth-browser snapshot <url> [--profile NAME] [--out FILE]
 
 ```python
 import asyncio
-from stealth_browser.browser import open_browser, human_scroll, human_type
+from stealth_browser.browser import open_browser, apply_stealth, human_scroll, human_type
 
 async def main():
     p, browser, ctx, profile_dir = await open_browser("my-profile")
     page = await ctx.new_page()
     await page.goto("https://example.com")
+    await apply_stealth(page)  # re-apply spoof in main world (see below)
     await human_scroll(page)
     await human_type(page, "input[name=q]", "hello world")
     # ... do work, then:
@@ -116,6 +120,12 @@ src/stealth_browser/
 
 ## Known limitations
 
+- **Init scripts can run in an isolated world** — on some patchright builds
+  (observed: 1.61.2 on arm64) `add_init_script` scripts execute in a world
+  where their `navigator`/`WebGL` patches never become visible to page
+  scripts. The toolkit therefore also re-applies the spoof in the page's
+  **main world** via `apply_stealth()` after every navigation. The spoof is
+  a single idempotent IIFE, so double application is harmless.
 - WebGL spoof is pinned to `AMD`; adjust if the target validates GPU-vs-UA
   platform consistency
 - `VIDEO_CODECS` shows `WARN` in headless (a real headless Chrome does the
