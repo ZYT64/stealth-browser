@@ -7,6 +7,8 @@ the raw captured values into a PASS/WARN/FAIL classification that the CLI
 renders as a summary and persists as a JSON report.
 """
 
+import re
+
 # JS checks executed in the page. This is an *async* IIFE so we can query
 # `navigator.permissions` inside the same payload instead of a second round
 # trip. With patchright + full Chromium the values should match a real
@@ -63,6 +65,22 @@ async () => {
       return h.toString(16);
     } catch (e) { return 'err'; }
   })();
+  // UA-CH (client hints): what the page sees must be consistent with the UA
+  // string we advertise. Guarded — older engines without userAgentData just
+  // report nulls and the analyzer treats them as missing.
+  const uad = navigator.userAgentData;
+  r.uaDataBrands = uad ? JSON.stringify(uad.brands) : null;
+  r.uaDataMobile = uad ? uad.mobile : null;
+  r.uaDataPlatform = uad ? uad.platform : null;
+  if (uad && uad.getHighEntropyValues) {
+    try {
+      const he = await uad.getHighEntropyValues(
+        ['uaFullVersion', 'fullVersionList', 'architecture', 'bitness', 'wow64']);
+      r.uaFullVersion = he.uaFullVersion;
+    } catch (e) { r.uaFullVersion = 'err:' + e.name; }
+  } else {
+    r.uaFullVersion = null;
+  }
   return r;
 }
 """
@@ -128,6 +146,47 @@ def analyze_report(results: dict) -> dict:
         add("webgl", "WARN", f"unexpected renderer: {gl}", "AMD Radeon")
     add("webglVendor", "PASS" if "AMD" in str(results.get("webglVendor", ""))
         else "WARN", "GPU vendor matches spoofed renderer", "Google Inc. (AMD)")
+
+    # -- client hints (UA-CH): modern anti-bot checks these for consistency --
+    # Real Chrome advertises a "Google Chrome" brand in navigator.userAgentData;
+    # headless builds report only "Chromium", a strong bot signal on its own.
+    ua_brands = results.get("uaDataBrands")
+    if ua_brands is None:
+        add("uaChBrands", "FAIL", "client hints unavailable (userAgentData missing)",
+            "Google Chrome + Chromium")
+    elif "Google Chrome" not in str(ua_brands):
+        add("uaChBrands", "FAIL", f"no 'Google Chrome' brand in {ua_brands}",
+            "Google Chrome + Chromium")
+    else:
+        add("uaChBrands", "PASS", "brands include Google Chrome",
+            "Google Chrome + Chromium")
+    # uaFullVersion must equal the full version in the UA string (headless
+    # builds leak a stale build number, e.g. .0 vs the UA's .55).
+    ua_m = re.search(r"Chrome/(\d+\.\d+\.\d+\.\d+)",
+                     str(results.get("userAgent", "")))
+    full = results.get("uaFullVersion")
+    if ua_m and full and not str(full).startswith("err:"):
+        add("uaChVersion", "PASS" if ua_m.group(1) == str(full) else "FAIL",
+            f"uaFullVersion {full} vs UA {ua_m.group(1)}", ua_m.group(1))
+    else:
+        add("uaChVersion", "WARN", "cannot compare (UA or uaFullVersion missing)",
+            "match UA full version")
+    # The client-hints platform must agree with the OS the UA claims.
+    ua = str(results.get("userAgent", ""))
+    ua_plat = ("Windows" if "Windows" in ua
+               else "Mac" if "Macintosh" in ua
+               else "Linux" if "Linux" in ua else "")
+    uad_plat = str(results.get("uaDataPlatform", ""))
+    plat_map = {"Linux": "Linux", "Windows": "Windows", "Mac": "macOS"}
+    if ua_plat and uad_plat and uad_plat in plat_map.values():
+        add("uaChPlatform", "PASS" if plat_map[ua_plat] == uad_plat else "FAIL",
+            f"client-hints platform {uad_plat} vs UA {ua_plat}", plat_map[ua_plat])
+    else:
+        add("uaChPlatform", "WARN", "cannot compare (missing uaDataPlatform)",
+            "match UA OS")
+    mobile = results.get("uaDataMobile")
+    add("uaChMobile", "PASS" if mobile is False else "WARN",
+        "desktop profile must not claim mobile", "false")
 
     # -- warnings: inconsistencies real browsers don't have -----------------
     add("plugins", "FAIL" if results.get("plugins", 0) == 0 else "PASS",
