@@ -125,17 +125,26 @@ async def test_apply_stealth_main_world():
         await page.goto("about:blank")
         await apply_stealth(page)
         r = await page.evaluate(
-            """() => {
+            """async () => {
                 const c = document.createElement('canvas').getContext('webgl');
                 const e = c && c.getExtension('WEBGL_debug_renderer_info');
+                const uad = navigator.userAgentData;
+                const he = uad && uad.getHighEntropyValues
+                    ? await uad.getHighEntropyValues(['uaFullVersion'])
+                    : null;
                 return {
                     deviceMemory: navigator.deviceMemory,
                     renderer: e ? c.getParameter(e.UNMASKED_RENDERER_WEBGL) : 'no-gl',
+                    uadBrands: uad ? uad.brands.map(b => b.brand) : [],
+                    uaFullVersion: he ? he.uaFullVersion : null,
                 };
             }"""
         )
         assert r["deviceMemory"] == 8
         assert "AMD" in r["renderer"]
+        # UA-CH consistency: flagship brand present and version synced to the UA
+        assert "Google Chrome" in r["uadBrands"]
+        assert r["uaFullVersion"] == "149.0.7827.55"
     finally:
         await browser.close()
         await p.stop()
