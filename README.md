@@ -35,6 +35,10 @@ of *removing* it entirely is what actually passes detection.
 
 - 🚀 **Anti-fingerprint launch** — full Chromium (not headless-shell), real
   Chrome UA, `deviceMemory=8`, spoofed `AMD Radeon` WebGL renderer
+- 🧩 **UA-CH consistency** — `navigator.userAgentData` spoofed to match the
+  Chrome UA: `Google Chrome` brand present and `uaFullVersion` synced to the
+  UA version (headless builds omit the flagship brand and report a stale
+  build number — both are bot tells)
 - 🖱️ **Human-like interaction** — randomized delays, progressive scrolling
   with occasional backtracks, ease-in-out curved mouse paths, type character
   by character
@@ -115,6 +119,8 @@ src/stealth_browser/
 | CDP debug port / `$cdc_` marker | ✅ cleared |
 | `deviceMemory` → 8 | ✅ |
 | WebGL renderer → AMD Radeon | ✅ |
+| UA-CH (`userAgentData`) brands → Google Chrome + Chromium | ✅ |
+| UA-CH `uaFullVersion` → matches UA version | ✅ |
 | PhantomJS / Selenium artifacts | ✅ all pass |
 | iframe / sandbox injection | ✅ all pass |
 
