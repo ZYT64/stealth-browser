@@ -39,6 +39,13 @@ def _clean_results():
         "webgl": "ANGLE (AMD, AMD Radeon Graphics (RADV VEGA10) Direct3D11 "
                  "vs_5_0 ps_5_0, D3D11)",
         "canvas": "a1b2c3d4",
+        # UA-CH (client hints) must match the spoofed Chrome profile
+        "uaDataBrands": ('[{"brand": "Google Chrome", "version": "149"}, '
+                         '{"brand": "Chromium", "version": "149"}, '
+                         '{"brand": "Not)A;Brand", "version": "24"}]'),
+        "uaDataMobile": False,
+        "uaDataPlatform": "Linux",
+        "uaFullVersion": "149.0.7827.55",
     }
 
 
@@ -125,6 +132,66 @@ def test_info_checks_are_present():
     a = analyze_report(_clean_results())
     assert a["checks"]["canvas"]["status"] == "INFO"
     assert a["checks"]["platform"]["status"] == "INFO"
+
+
+# --------------------------------------------------------------------------
+# analyze_report — UA-CH (client hints) consistency
+# --------------------------------------------------------------------------
+def test_clean_ua_ch_checks_pass():
+    a = analyze_report(_clean_results())
+    assert a["checks"]["uaChBrands"]["status"] == "PASS"
+    assert a["checks"]["uaChVersion"]["status"] == "PASS"
+    assert a["checks"]["uaChPlatform"]["status"] == "PASS"
+    assert a["checks"]["uaChMobile"]["status"] == "PASS"
+
+
+def test_missing_chrome_brand_is_flagged():
+    """Headless builds omit the flagship brand — a strong bot signal."""
+    r = _clean_results()
+    r["uaDataBrands"] = ('[{"brand": "Chromium", "version": "149"}, '
+                         '{"brand": "Not)A;Brand", "version": "24"}]')
+    a = analyze_report(r)
+    assert a["checks"]["uaChBrands"]["status"] == "FAIL"
+    assert a["summary"]["verdict"] == "flagged"
+
+
+def test_ua_full_version_mismatch_is_flagged():
+    """Stale build number (e.g. .0 vs the UA's .55) is a headless tell."""
+    r = _clean_results()
+    r["uaFullVersion"] = "149.0.7827.0"
+    a = analyze_report(r)
+    assert a["checks"]["uaChVersion"]["status"] == "FAIL"
+    assert a["summary"]["verdict"] == "flagged"
+
+
+def test_ua_platform_mismatch_is_flagged():
+    r = _clean_results()
+    r["uaDataPlatform"] = "Windows"
+    a = analyze_report(r)
+    assert a["checks"]["uaChPlatform"]["status"] == "FAIL"
+
+
+def test_ua_mobile_claim_warns():
+    r = _clean_results()
+    r["uaDataMobile"] = True
+    a = analyze_report(r)
+    assert a["checks"]["uaChMobile"]["status"] == "WARN"
+    assert a["summary"]["verdict"] == "attention"
+
+
+def test_ua_ch_missing_keys_warn_not_crash():
+    """Partial UA-CH data (e.g. old engine without userAgentData) degrades
+    to WARN for the version/platform checks, never raises."""
+    r = _clean_results()
+    del r["uaDataBrands"]
+    del r["uaDataMobile"]
+    del r["uaDataPlatform"]
+    r["uaFullVersion"] = None
+    a = analyze_report(r)
+    assert a["checks"]["uaChBrands"]["status"] == "FAIL"  # missing = hard signal
+    assert a["checks"]["uaChVersion"]["status"] == "WARN"
+    assert a["checks"]["uaChPlatform"]["status"] == "WARN"
+    assert a["checks"]["uaChMobile"]["status"] == "WARN"
 
 
 # --------------------------------------------------------------------------
