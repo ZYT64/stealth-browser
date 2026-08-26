@@ -14,9 +14,12 @@ import argparse
 import asyncio
 import json
 import random
+import re
 import sys
 import time
 from pathlib import Path
+
+from dataclasses import dataclass
 
 from patchright.async_api import async_playwright
 
@@ -38,7 +41,15 @@ REAL_UA = (
 # patchright removes that property entirely (a property that merely exists
 # is itself a marker). Written as a single IIFE *expression* so it works
 # both as an init script and via page.evaluate (see apply_stealth).
-STEALTH_INIT = """
+#
+# UA-CH (Client Hints) consistency: real Chrome advertises a "Google Chrome"
+# brand (plus Chromium and a greased brand) and a uaFullVersion equal to the
+# UA's full version; the headless build reports only "Chromium" and a stale
+# build number (e.g. 149.0.7827.0 while the UA says 149.0.7827.55). Both are
+# classic bot signals checked by modern anti-bot systems (DataDome, CF, ...).
+# Version placeholders are filled from REAL_UA at import time so the spoof
+# can never drift from the UA we advertise.
+STEALTH_INIT_TMPL = """
 (() => {
   Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
   const spoof = (proto) => {
@@ -51,8 +62,54 @@ STEALTH_INIT = """
   };
   try { spoof(WebGLRenderingContext.prototype); } catch(e) {}
   try { spoof(WebGL2RenderingContext.prototype); } catch(e) {}
+  // UA-CH (client hints): define unconditionally — about:blank does not
+  // expose userAgentData at all, and on real pages it lives either on the
+  // navigator instance or its prototype. Defining on the instance shadows
+  // a prototype getter; falling back to the prototype covers the rest.
+  const uad = {
+    brands: [
+      {brand: 'Google Chrome', version: '__UA_MAJOR__'},
+      {brand: 'Chromium', version: '__UA_MAJOR__'},
+      {brand: 'Not)A;Brand', version: '24'},
+    ],
+    mobile: false,
+    platform: 'Linux',
+    getHighEntropyValues: () => Promise.resolve({
+      architecture: 'x86',
+      bitness: '64',
+      brands: uad.brands,
+      fullVersionList: [
+        {brand: 'Google Chrome', version: '__UA_FULL__'},
+        {brand: 'Chromium', version: '__UA_FULL__'},
+        {brand: 'Not)A;Brand', version: '24.0.0.0'},
+      ],
+      mobile: false,
+      model: '',
+      platform: 'Linux',
+      platformVersion: '',
+      uaFullVersion: '__UA_FULL__',
+      wow64: false,
+    }),
+    toJSON: () => ({brands: uad.brands, mobile: false, platform: 'Linux'}),
+  };
+  try {
+    Object.defineProperty(navigator, 'userAgentData',
+      {get: () => uad, configurable: true});
+  } catch(e) {
+    try {
+      Object.defineProperty(Navigator.prototype, 'userAgentData',
+        {get: () => uad, configurable: true});
+    } catch(e2) {}
+  }
 })()
 """
+
+_UA_VER = re.search(r"Chrome/(\d+\.\d+\.\d+\.\d+)", REAL_UA)
+STEALTH_INIT = (
+    STEALTH_INIT_TMPL
+    .replace("__UA_FULL__", _UA_VER.group(1))
+    .replace("__UA_MAJOR__", _UA_VER.group(1).split(".")[0])
+)
 
 
 async def apply_stealth(page) -> None:
@@ -245,6 +302,106 @@ async def cmd_snapshot(args) -> None:
 
 
 # --------------------------------------------------------------------------
+# Profile management
+# --------------------------------------------------------------------------
+@dataclass
+class ProfileInfo:
+    """Human-readable summary of a persisted browser profile."""
+    name: str
+    dir: Path
+    age_seconds: float
+    state_size: int | None
+    n_profiles: int
+
+
+def _scan_profiles(root: Path | None = None) -> list[ProfileInfo]:
+    """Walk STEALTH_HOME/profiles and enumerate each profile directory.
+
+    A profile is any sub-directory containing (or able to hold) a persisted
+    ``state.json`` storage state. Directories without state yet (freshly
+    created, never saved) are still reported so ``profiles list`` shows them.
+    """
+    root = root or PROFILE_DIR
+    root.mkdir(parents=True, exist_ok=True)
+    infos: list[ProfileInfo] = []
+    now = time.time()
+    for child in sorted(root.iterdir()):
+        if not child.is_dir():
+            continue
+        state = child / "state.json"
+        mtime = state.stat().st_mtime if state.exists() else child.stat().st_mtime
+        infos.append(
+            ProfileInfo(
+                name=child.name,
+                dir=child,
+                age_seconds=now - mtime,
+                state_size=state.stat().st_size if state.exists() else None,
+                n_profiles=len(sorted(root.iterdir())),
+            )
+        )
+    return infos
+
+
+def _reset_profile(name: str, root: Path | None = None) -> Path:
+    """Remove a profile's persisted state.json (keep the profile dir).
+
+    Useful to start fresh when a profile's cookies/localStorage look
+    contaminated. Returns the path to the removed state file (or the
+    profile dir if no state existed). Refuses to operate on an
+    empty/``.``/``..`` name so we never touch a parent directory.
+    """
+    root = root or PROFILE_DIR
+    # Refuse anything that is empty, a path separator, or could traverse
+    # outside ``root`` (e.g. ``.``/``..``/``../etc``). We never operate on a
+    # parent directory — that would risk wiping unrelated data.
+    if not name or (Path(name).name != name):
+        raise ValueError("profile name must be a non-empty, relative name")
+    d = root / name
+    try:
+        resolved = d.resolve(strict=False)
+    except OSError:
+        resolved = d
+    root_resolved = root.resolve(strict=False)
+    if root_resolved not in resolved.parents and resolved != root_resolved:
+        raise ValueError(f"profile name escapes profiles dir: {name}")
+    if not d.is_dir():
+        raise FileNotFoundError(f"profile not found: {name} (under {root})")
+    state = d / "state.json"
+    if state.exists():
+        state.unlink()
+        return state
+    return d
+
+
+def cmd_reset(args) -> None:
+    """Reset (wipe stored login state for) a profile."""
+    try:
+        removed = _reset_profile(args.profile)
+    except (ValueError, FileNotFoundError) as e:
+        print(f"error: {e}")
+        raise SystemExit(1)
+    if removed.is_file():
+        print(f"Reset {args.profile}: removed {removed.name} (login state cleared)")
+    else:
+        print(f"Reset {args.profile}: no stored state to clear")
+
+
+def cmd_profiles(args) -> None:
+    """List existing persisted browser profiles and show the total count."""
+    infos = _scan_profiles()
+    if not infos:
+        print("No profiles found (use `stealth-browser open <url> --profile NAME` to create one).")
+        return
+    # Show the newest first (most recently used on top).
+    infos.sort(key=lambda i: i.age_seconds)
+    print(f"{len(infos)} profile(s) under {PROFILE_DIR}")
+    for i in infos:
+        age = f"{i.age_seconds/3600:,.1f}h ago" if i.age_seconds >= 3600 else f"{i.age_seconds/60:,.1f}m ago"
+        state = f"state.json {i.state_size:,}B" if i.state_size is not None else "no state yet"
+        print(f"  - {i.name:<20} {age:<12} {state}")
+
+
+# --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
 def main() -> None:
@@ -266,6 +423,11 @@ def main() -> None:
         sp.add_argument("--keep", action="store_true")
         sp.add_argument("--out", default=None)
 
+    pr = sub.add_parser("profiles", help="List persisted browser profiles")
+
+    rs = sub.add_parser("reset", help="Reset/clear a profile's stored login state")
+    rs.add_argument("--profile", default="default")
+
     args = ap.parse_args()
 
     if args.cmd == "check":
@@ -276,6 +438,10 @@ def main() -> None:
         asyncio.run(cmd_dump(args))
     elif args.cmd == "snapshot":
         asyncio.run(cmd_snapshot(args))
+    elif args.cmd == "profiles":
+        cmd_profiles(args)
+    elif args.cmd == "reset":
+        cmd_reset(args)
 
 
 if __name__ == "__main__":
