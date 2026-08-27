@@ -46,6 +46,15 @@ def _clean_results():
         "uaDataMobile": False,
         "uaDataPlatform": "Linux",
         "uaFullVersion": "149.0.7827.55",
+        # extended checks (iframe leak, fonts, screen, chrome internals)
+        "iframeWebdriver": None,
+        "fonts": {"Arial": True, "Times New Roman": True, "Courier New": True,
+                  "Verdana": True, "Georgia": True},
+        "screenWidth": 1366,
+        "screenHeight": 768,
+        "screenColorDepth": 24,
+        "chromeCsi": True,
+        "chromeLoadTimes": True,
     }
 
 
@@ -195,6 +204,93 @@ def test_ua_ch_missing_keys_warn_not_crash():
 
 
 # --------------------------------------------------------------------------
+# analyze_report — extended checks (iframe leak, fonts, locale, screen)
+# --------------------------------------------------------------------------
+def test_iframe_webdriver_leak_is_flagged():
+    r = _clean_results()
+    r["iframeWebdriver"] = True
+    a = analyze_report(r)
+    assert a["checks"]["iframeWebdriver"]["status"] == "FAIL"
+    assert a["summary"]["verdict"] == "flagged"
+
+
+def test_iframe_webdriver_string_true_is_flagged():
+    r = _clean_results()
+    r["iframeWebdriver"] = "true"
+    a = analyze_report(r)
+    assert a["checks"]["iframeWebdriver"]["status"] == "FAIL"
+
+
+def test_iframe_webdriver_unverifiable_warns():
+    r = _clean_results()
+    r["iframeWebdriver"] = "err:SecurityError"
+    a = analyze_report(r)
+    assert a["checks"]["iframeWebdriver"]["status"] == "WARN"
+    assert a["summary"]["verdict"] == "attention"
+
+
+def test_no_standard_fonts_is_flagged():
+    r = _clean_results()
+    r["fonts"] = {k: False for k in r["fonts"]}
+    a = analyze_report(r)
+    assert a["checks"]["fonts"]["status"] == "FAIL"
+    assert a["summary"]["verdict"] == "flagged"
+
+
+def test_partially_missing_fonts_warns():
+    r = _clean_results()
+    fonts = r["fonts"]
+    for k in list(fonts)[:2]:
+        fonts[k] = False
+    a = analyze_report(r)
+    assert a["checks"]["fonts"]["status"] == "WARN"
+    assert a["summary"]["verdict"] == "attention"
+
+
+def test_fonts_unprobeable_warns():
+    r = _clean_results()
+    r["fonts"] = "err:no-2d"
+    a = analyze_report(r)
+    assert a["checks"]["fonts"]["status"] == "WARN"
+
+
+def test_languages_locale_mismatch_warns():
+    r = _clean_results()
+    r["languages"] = ["en-US", "en"]
+    a = analyze_report(r)
+    assert a["checks"]["languages"]["status"] == "WARN"
+    assert a["summary"]["verdict"] == "attention"
+
+
+def test_languages_missing_warns():
+    r = _clean_results()
+    r["languages"] = None
+    a = analyze_report(r)
+    assert a["checks"]["languages"]["status"] == "WARN"
+
+
+def test_small_screen_warns():
+    r = _clean_results()
+    r["screenWidth"], r["screenHeight"] = 800, 600
+    a = analyze_report(r)
+    assert a["checks"]["screenSize"]["status"] == "WARN"
+    assert a["summary"]["verdict"] == "attention"
+
+
+def test_plausible_screen_is_info():
+    r = _clean_results()
+    r["screenWidth"], r["screenHeight"] = 1920, 1080
+    a = analyze_report(r)
+    assert a["checks"]["screenSize"]["status"] == "INFO"
+
+
+def test_chrome_internals_are_info():
+    a = analyze_report(_clean_results())
+    assert a["checks"]["chromeCsi"]["status"] == "INFO"
+    assert a["checks"]["chromeLoadTimes"]["status"] == "INFO"
+
+
+# --------------------------------------------------------------------------
 # CHECKS — JS payload sanity
 # --------------------------------------------------------------------------
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
@@ -236,7 +332,8 @@ def test_checks_js_executes_without_reference_errors():
     const result = (""" + CHECKS + """)();
     result.then(r => {
       if (typeof r !== 'object' || r === null) throw new Error('not an object');
-      if (!('webdriver' in r) || !('canvas' in r) || !('permissions' in r)) {
+      if (!('webdriver' in r) || !('canvas' in r) || !('permissions' in r)
+          || !('iframeWebdriver' in r) || !('fonts' in r)) {
         throw new Error('missing keys: ' + Object.keys(r));
       }
       if (r.permissions !== 'prompt') throw new Error('permissions: ' + r.permissions);
