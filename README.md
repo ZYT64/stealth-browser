@@ -44,8 +44,9 @@ of *removing* it entirely is what actually passes detection.
   by character
 - 💾 **Persistent profiles** — cookies/localStorage survive restarts, so you
   log in once and stay logged in
-- 🔍 **Fingerprint self-check** — local JS checks + optional sannysoft remote
-  scan
+- 🔍 **Fingerprint self-check** — local JS checks (webdriver incl. inside
+  iframes, UA-CH consistency, standard font availability, locale/languages
+  cross-check, screen plausibility) + optional sannysoft remote scan
 - 🌐 **Configurable** — locale, timezone, viewport, custom UA all exposed
 
 ## Install
@@ -136,6 +137,9 @@ src/stealth_browser/
   platform consistency
 - `VIDEO_CODECS` shows `WARN` in headless (a real headless Chrome does the
   same — not a detection failure)
+- **Font availability matters** — minimal containers without fontconfig
+  fonts (e.g. no `fonts-liberation`) fail the standard-fonts check; real
+  desktop browsers always ship common fonts
 - **Interactive Turnstile (image click) is NOT auto-solved** — the toolkit
   stops and waits for a human. Bypassing CAPTCHAs is out of scope.
 - Default is direct residential IP; configure a proxy pool separately if you
