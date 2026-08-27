@@ -65,6 +65,69 @@ async () => {
       return h.toString(16);
     } catch (e) { return 'err'; }
   })();
+  // -- extended surface checks ---------------------------------------------
+  // webdriver inside a same-origin about:blank iframe: stealth patches that
+  // only cover the top frame (or init scripts stuck in an isolated world)
+  // leak here even when the main frame looks clean. A real detection
+  // technique — sannysoft and creepjs both test nested frames.
+  r.iframeWebdriver = await new Promise((resolve) => {
+    try {
+      if (!document.body) { resolve('nobody'); return; }
+      const f = document.createElement('iframe');
+      let done = false;
+      const finish = (v) => {
+        if (done) return;
+        done = true;
+        try { f.remove(); } catch (e) {}
+        resolve(v);
+      };
+      f.onload = () => {
+        try {
+          const w = f.contentWindow;
+          finish(w && w.navigator && w.navigator.webdriver !== undefined
+            ? String(w.navigator.webdriver) : null);
+        } catch (e) { finish('err:' + e.name); }
+      };
+      try {
+        f.style.display = 'none';
+        document.body.appendChild(f);
+      } catch (e) { finish('err:' + e.name); return; }
+      // about:blank frames are usually ready synchronously; the timer only
+      // covers engines that fire onload late (finish() is idempotent).
+      setTimeout(() => { try { if (f.onload) f.onload(); } catch (e) { finish('err:timeout'); } }, 50);
+    } catch (e) { resolve('err:' + e.name); }
+  });
+  // Standard font availability: minimal bot containers ship no fonts, real
+  // desktops have Arial/Times/etc (Linux maps them via fontconfig). Metric
+  // based detection (same idea as fingerprintjs): the probe font is
+  // installed only if the width differs from BOTH generic baselines.
+  r.fonts = (() => {
+    try {
+      const c = document.createElement('canvas');
+      const ctx = c.getContext && c.getContext('2d');
+      if (!ctx) return 'err:no-2d';
+      const text = 'mmmmmmmmmmlli Ww@#0123 ';
+      const measure = (font) => { ctx.font = '72px ' + font; return ctx.measureText(text).width; };
+      const baseMono = measure('monospace');
+      const baseSerif = measure('serif');
+      const out = {};
+      for (const f of ['Arial', 'Times New Roman', 'Courier New', 'Verdana', 'Georgia']) {
+        const a = measure(f + ', monospace');
+        const b = measure(f + ', serif');
+        out[f] = (a !== baseMono) && (b !== baseSerif);
+      }
+      return out;
+    } catch (e) { return 'err:' + e.name; }
+  })();
+  try {
+    r.screenWidth = screen.width;
+    r.screenHeight = screen.height;
+    r.screenColorDepth = screen.colorDepth;
+  } catch (e) {
+    r.screenWidth = null; r.screenHeight = null; r.screenColorDepth = null;
+  }
+  r.chromeCsi = !!(window.chrome && window.chrome.csi);
+  r.chromeLoadTimes = !!(window.chrome && window.chrome.loadTimes);
   // UA-CH (client hints): what the page sees must be consistent with the UA
   // string we advertise. Guarded — older engines without userAgentData just
   // report nulls and the analyzer treats them as missing.
@@ -91,6 +154,7 @@ EXPECTED = {
     "timezone_name": "Asia/Shanghai",
     "timezone_offset_min": -480,  # UTC+8
     "device_memory": 8,
+    "locale": "zh-CN",
 }
 
 
@@ -130,6 +194,15 @@ def analyze_report(results: dict) -> dict:
     add("webdriver", "FAIL" if results.get("webdriver") else "PASS",
         "must be absent/undefined (patchright removes it)",
         "absent")
+    # webdriver inside an about:blank iframe — patches that only cover the
+    # top frame leak here even when the main frame looks clean.
+    ifw = results.get("iframeWebdriver")
+    if ifw is None or ifw is False or str(ifw).lower() == "false":
+        add("iframeWebdriver", "PASS", "webdriver absent inside iframe too", "absent")
+    elif ifw is True or str(ifw).lower() == "true":
+        add("iframeWebdriver", "FAIL", f"iframe leaks webdriver={ifw}", "absent")
+    else:
+        add("iframeWebdriver", "WARN", f"cannot verify iframe webdriver ({ifw})", "absent")
     if "HeadlessChrome" in str(results.get("userAgent", "")):
         add("userAgent", "FAIL", "HeadlessChrome leak in UA", "no 'HeadlessChrome'")
     else:
@@ -191,6 +264,21 @@ def analyze_report(results: dict) -> dict:
     # -- warnings: inconsistencies real browsers don't have -----------------
     add("plugins", "FAIL" if results.get("plugins", 0) == 0 else "PASS",
         "headless shell reports 0 plugins", ">= 1")
+    fonts = results.get("fonts")
+    if isinstance(fonts, dict) and fonts:
+        avail = sum(1 for v in fonts.values() if v)
+        total = len(fonts)
+        if avail == 0:
+            add("fonts", "FAIL", f"no standard fonts installed (0/{total}) — minimal container",
+                ">= 1 of the common desktop fonts")
+        elif avail < total:
+            add("fonts", "WARN", f"some standard fonts missing ({avail}/{total})",
+                "all common desktop fonts")
+        else:
+            add("fonts", "PASS", f"standard fonts present ({avail}/{total})",
+                "all common desktop fonts")
+    else:
+        add("fonts", "WARN", f"cannot probe fonts ({fonts})", "all common desktop fonts")
     add("permissions", "WARN" if str(results.get("permissions", "")).startswith("err")
         else ("PASS" if results.get("permissions") in ("prompt", "granted") else "WARN"),
         "query state should be prompt/granted", "prompt|granted")
@@ -209,7 +297,19 @@ def analyze_report(results: dict) -> dict:
         f"{EXPECTED['timezone_name']} / {EXPECTED['timezone_offset_min']}")
 
     # -- informational: no single right answer, useful for spotting drift ---
-    add("languages", "INFO", f"{results.get('languages')}", "zh-CN-ish")
+    # locale/languages consistency: anti-bot systems cross-check the HTTP
+    # Accept-Language header against navigator.languages — a mismatch is a
+    # classic misconfigured-spoof tell.
+    langs = results.get("languages")
+    if isinstance(langs, (list, tuple)) and langs:
+        first = str(langs[0]).lower()
+        add("languages",
+            "PASS" if first.startswith(EXPECTED["locale"][:2].lower()) else "WARN",
+            f"languages[0]={langs[0]} must match locale {EXPECTED['locale']}",
+            f"{EXPECTED['locale']} first")
+    else:
+        add("languages", "WARN", f"navigator.languages unavailable ({langs})",
+            f"{EXPECTED['locale']} first")
     add("platform", "INFO", f"{results.get('platform')}", "Linux x86_64")
     add("maxTouchPoints", "INFO", "desktop should be 0",
         "0")
@@ -221,6 +321,23 @@ def analyze_report(results: dict) -> dict:
         "stable hash")
     add("chrome", "INFO", f"window.chrome present: {bool(results.get('chrome'))}",
         "True")
+    sw, sh = results.get("screenWidth"), results.get("screenHeight")
+    if isinstance(sw, int) and isinstance(sh, int) and sw > 0 and sh > 0:
+        plausible = sw >= 1024 and sh >= 700
+        checks["screenSize"] = {
+            "status": "INFO" if plausible else "WARN",
+            "expected": ">= 1024x700",
+            "actual": f"{sw}x{sh}",
+            "note": (f"screen {sw}x{sh}" if plausible else
+                     f"screen {sw}x{sh} — suspiciously small (headless default is 800x600)"),
+        }
+    else:
+        add("screenSize", "WARN", f"screen size unavailable ({sw}x{sh})", ">= 1024x700")
+    add("chromeCsi", "INFO", f"chrome.csi present: {bool(results.get('chromeCsi'))}",
+        "True on real Chrome")
+    add("chromeLoadTimes", "INFO",
+        f"chrome.loadTimes present: {bool(results.get('chromeLoadTimes'))}",
+        "True on real Chrome")
 
     s = {"passed": 0, "warned": 0, "failed": 0, "info": 0}
     for c in checks.values():
