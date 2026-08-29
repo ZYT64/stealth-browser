@@ -17,6 +17,7 @@ import random
 import re
 import sys
 import time
+import weakref
 from pathlib import Path
 
 from dataclasses import dataclass
@@ -127,9 +128,127 @@ async def apply_stealth(page) -> None:
 # --------------------------------------------------------------------------
 # Human-like interaction helpers
 # --------------------------------------------------------------------------
+# Remembered cursor position per page (Playwright does not expose the current
+# mouse position). Lets consecutive human_move/human_click calls continue the
+# path from wherever the cursor was left instead of teleporting.
+_last_mouse: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def _remember_mouse(page, x: float, y: float) -> None:
+    try:
+        _last_mouse[page] = (float(x), float(y))
+    except TypeError:  # page not weakref-able — skip tracking
+        pass
+
+
+def _last_position(page):
+    try:
+        return _last_mouse.get(page)
+    except TypeError:
+        return None
+
+
 def human_delay(a: float = 0.8, b: float = 2.5) -> None:
     """Random human delay (seconds) modelling read/think pacing."""
     time.sleep(random.uniform(a, b))
+
+
+async def _curve_to(page, sx: float, sy: float, tx: float, ty: float,
+                    steps: int | None = None, end_jitter: float = 6.0) -> None:
+    """Move the mouse along an ease-in-out curve from (sx, sy) to (tx, ty).
+
+    Jitter tapers to ``end_jitter`` (applied on every step, scaled down as the
+    cursor approaches the target) so callers can require a precise landing —
+    human_move keeps the loose ±6px finish, clicks need to land inside the
+    element they aim at. Records the final position for cursor continuity.
+    """
+    steps = steps or random.randint(12, 24)
+    for i in range(1, steps + 1):
+        t = i / steps
+        ease = t * t * (3 - 2 * t)  # smoothstep
+        j = end_jitter * (1 - t)
+        cx = sx + (tx - sx) * ease + random.uniform(-j, j)
+        cy = sy + (ty - sy) * ease + random.uniform(-j, j)
+        await page.mouse.move(cx, cy)
+        await asyncio.sleep(random.uniform(0.008, 0.03))
+    _remember_mouse(page, tx, ty)
+
+
+async def human_move(page, x: int | None = None, y: int | None = None) -> None:
+    """Curved (ease-in-out) mouse movement with jitter."""
+    start = _last_position(page) or (random.randint(200, 900),
+                                      random.randint(200, 600))
+    sx, sy = start
+    tx, ty = (
+        x if x is not None else random.randint(100, 1200),
+        y if y is not None else random.randint(100, 700),
+    )
+    await _curve_to(page, sx, sy, tx, ty)
+
+
+async def human_click(page, selector: str | None = None, *,
+                      locator=None, press=(0.04, 0.13)) -> None:
+    """Human-like click: curved approach, random aim point, real press.
+
+    A plain ``locator.click()`` teleports the cursor to the element center in
+    one step — real browsers see a stream of movement events first, and
+    instant jumps (or every click landing on dead center) are automation
+    tells. This helper:
+
+    1. scrolls the element into view and reads its bounding box,
+    2. aims at a random point in the middle 50% of the box (humans miss
+       dead center),
+    3. moves the cursor there along the shared ease-in-out curve, starting
+       from the *remembered* cursor position when one exists,
+    4. pauses briefly, then presses and releases with a human down/up gap.
+
+    Falls back to ``locator.click()`` when the element exposes no bounding
+    box (hidden/detached), and to ``page.click(selector)`` for page objects
+    without ``.locator`` (duck-typed stand-ins). Safe for repeated use:
+    cursor continuity makes follow-up clicks start where the last ended.
+    """
+    loc = locator if locator is not None else (
+        page.locator(selector) if hasattr(page, "locator") else None)
+    if loc is None:  # duck-typed page without locator support
+        await page.click(selector)
+        return
+    try:
+        await loc.scroll_into_view_if_needed()
+    except Exception:
+        pass  # already in view / scroll not needed / not supported
+    box = None
+    try:
+        box = await loc.bounding_box()
+    except Exception:
+        box = None
+    if not box:
+        await loc.click()
+        return
+    # Aim inside the element, biased away from the exact center.
+    tx = box["x"] + box["width"] * random.uniform(0.25, 0.75)
+    ty = box["y"] + box["height"] * random.uniform(0.25, 0.75)
+    # Approach from the remembered cursor position, else somewhere nearby.
+    sx, sy = _last_position(page) or (
+        max(2, tx + random.randint(-300, 300)),
+        max(2, ty + random.randint(-200, 200)),
+    )
+    await _curve_to(page, sx, sy, tx, ty, end_jitter=0)
+    await asyncio.sleep(random.uniform(0.05, 0.2))  # confirm the target
+    await page.mouse.down()
+    await asyncio.sleep(random.uniform(*press))     # real press isn't instant
+    await page.mouse.up()
+
+
+async def human_type(page, selector: str, text: str) -> None:
+    """Type character-by-character with random inter-key delays.
+
+    Focuses the field with a human-like click (curved cursor approach, not a
+    teleport) before typing.
+    """
+    await human_click(page, selector)
+    for ch in text:
+        await page.keyboard.type(ch)
+        await asyncio.sleep(random.uniform(0.03, 0.12))
 
 
 async def human_scroll(page, steps: int | None = None, pause=(0.3, 0.9)) -> None:
@@ -142,31 +261,6 @@ async def human_scroll(page, steps: int | None = None, pause=(0.3, 0.9)) -> None
     # Occasionally scroll back a bit, as a human re-reading would.
     if random.random() < 0.3:
         await page.mouse.wheel(0, -random.randint(50, 150))
-
-
-async def human_move(page, x: int | None = None, y: int | None = None) -> None:
-    """Curved (ease-in-out) mouse movement with jitter."""
-    sx, sy = random.randint(200, 900), random.randint(200, 600)
-    tx, ty = (
-        x if x is not None else random.randint(100, 1200),
-        y if y is not None else random.randint(100, 700),
-    )
-    steps = random.randint(12, 24)
-    for i in range(1, steps + 1):
-        t = i / steps
-        ease = t * t * (3 - 2 * t)  # smoothstep
-        cx = sx + (tx - sx) * ease + random.uniform(-6, 6)
-        cy = sy + (ty - sy) * ease + random.uniform(-6, 6)
-        await page.mouse.move(cx, cy)
-        await asyncio.sleep(random.uniform(0.008, 0.03))
-
-
-async def human_type(page, selector: str, text: str) -> None:
-    """Type character-by-character with random inter-key delays."""
-    await page.click(selector)
-    for ch in text:
-        await page.keyboard.type(ch)
-        await asyncio.sleep(random.uniform(0.03, 0.12))
 
 
 # --------------------------------------------------------------------------
