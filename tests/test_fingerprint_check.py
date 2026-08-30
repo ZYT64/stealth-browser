@@ -38,6 +38,12 @@ def _clean_results():
         "webglVendor": "Google Inc. (AMD)",
         "webgl": "ANGLE (AMD, AMD Radeon Graphics (RADV VEGA10) Direct3D11 "
                  "vs_5_0 ps_5_0, D3D11)",
+        "webgl2": "ANGLE (AMD, AMD Radeon Graphics (RADV VEGA10) Direct3D11 "
+                  "vs_5_0 ps_5_0, D3D11)",
+        "webgl2Vendor": "Google Inc. (AMD)",
+        "pluginNames": ["PDF Viewer", "Chrome PDF Viewer",
+                        "Chromium PDF Viewer", "Microsoft Edge PDF Viewer",
+                        "WebKit built-in PDF"],
         "canvas": "a1b2c3d4",
         # UA-CH (client hints) must match the spoofed Chrome profile
         "uaDataBrands": ('[{"brand": "Google Chrome", "version": "149"}, '
@@ -101,6 +107,71 @@ def test_zero_plugins_is_flagged():
     r["plugins"] = 0
     a = analyze_report(r)
     assert a["checks"]["plugins"]["status"] == "FAIL"
+
+
+# --------------------------------------------------------------------------
+# analyze_report — WebGL2 / WebGL1 cross-context consistency
+# --------------------------------------------------------------------------
+def test_webgl2_swiftshader_leak_is_flagged():
+    """A WebGL1-only spoof: WebGL2 still reports the software renderer."""
+    r = _clean_results()
+    r["webgl2"] = "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device ...))"
+    r["webgl2Vendor"] = "Google Inc."
+    a = analyze_report(r)
+    assert a["checks"]["webgl2"]["status"] == "FAIL"
+    assert a["summary"]["verdict"] == "flagged"
+
+
+def test_webgl2_renderer_mismatch_is_flagged():
+    """WebGL2 renders with a different (unpatched) GPU than WebGL1 claims."""
+    r = _clean_results()
+    r["webgl2"] = "ANGLE (Unknown, Mesa llvmpipe (LLVM 15.0.7), OpenGL 4.5)"
+    a = analyze_report(r)
+    assert a["checks"]["webgl2"]["status"] == "FAIL"
+    assert a["summary"]["verdict"] == "flagged"
+
+
+def test_webgl2_absent_warns():
+    """Modern Chrome always ships WebGL2 — its absence is suspicious."""
+    r = _clean_results()
+    r["webgl2"] = "no-webgl2"
+    r["webgl2Vendor"] = "no-webgl2"
+    a = analyze_report(r)
+    assert a["checks"]["webgl2"]["status"] == "WARN"
+    assert a["checks"]["webgl2Vendor"]["status"] == "WARN"
+    assert a["summary"]["verdict"] == "attention"
+
+
+def test_webgl2_consistent_passes():
+    a = analyze_report(_clean_results())
+    assert a["checks"]["webgl2"]["status"] == "PASS"
+    assert a["checks"]["webgl2Vendor"]["status"] == "PASS"
+
+
+# --------------------------------------------------------------------------
+# analyze_report — plugin-name realism
+# --------------------------------------------------------------------------
+def test_plugin_names_with_pdf_viewers_pass():
+    a = analyze_report(_clean_results())
+    assert a["checks"]["pluginNames"]["status"] == "PASS"
+
+
+def test_fabricated_plugin_names_warn():
+    """Right length, wrong names — a length-only plugin spoof."""
+    r = _clean_results()
+    r["pluginNames"] = ["Plugin 1", "Plugin 2", "Plugin 3", "Plugin 4",
+                        "Plugin 5"]
+    a = analyze_report(r)
+    assert a["checks"]["pluginNames"]["status"] == "WARN"
+    assert a["summary"]["verdict"] == "attention"
+
+
+def test_new_checks_missing_keys_warn_not_crash():
+    """Old payloads without the new keys degrade to WARN, never raise."""
+    a = analyze_report({})
+    assert a["checks"]["webgl2"]["status"] == "WARN"
+    assert a["checks"]["webgl2Vendor"]["status"] == "WARN"
+    assert a["checks"]["pluginNames"]["status"] == "WARN"
 
 
 # --------------------------------------------------------------------------
@@ -333,7 +404,9 @@ def test_checks_js_executes_without_reference_errors():
     result.then(r => {
       if (typeof r !== 'object' || r === null) throw new Error('not an object');
       if (!('webdriver' in r) || !('canvas' in r) || !('permissions' in r)
-          || !('iframeWebdriver' in r) || !('fonts' in r)) {
+          || !('iframeWebdriver' in r) || !('fonts' in r)
+          || !('webgl2' in r) || !('webgl2Vendor' in r)
+          || !('pluginNames' in r)) {
         throw new Error('missing keys: ' + Object.keys(r));
       }
       if (r.permissions !== 'prompt') throw new Error('permissions: ' + r.permissions);
