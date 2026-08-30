@@ -47,6 +47,27 @@ async () => {
       return e ? c.getParameter(e.UNMASKED_RENDERER_WEBGL) : 'no-ext';
     } catch (e) { return 'err'; }
   })();
+  r.webgl2 = (() => {
+    // WebGL2 must report the SAME renderer as WebGL1: modern Chrome always
+    // ships WebGL2 and both contexts expose the same hardware. A spoof that
+    // only patches WebGLRenderingContext.prototype leaks the real (often
+    // SwiftShader) renderer through the WebGL2 context — a classic
+    // partial-spoof tell (fingerprintjs and creepjs probe both contexts).
+    try {
+      const c = document.createElement('canvas').getContext('webgl2');
+      if (!c) return 'no-webgl2';
+      const e = c.getExtension('WEBGL_debug_renderer_info');
+      return e ? c.getParameter(e.UNMASKED_RENDERER_WEBGL) : 'no-ext';
+    } catch (e) { return 'err'; }
+  })();
+  r.webgl2Vendor = (() => {
+    try {
+      const c = document.createElement('canvas').getContext('webgl2');
+      if (!c) return 'no-webgl2';
+      const e = c.getExtension('WEBGL_debug_renderer_info');
+      return e ? c.getParameter(e.UNMASKED_VENDOR_WEBGL) : 'no-ext';
+    } catch (e) { return 'err'; }
+  })();
   r.canvas = (() => {
     // Cheap fingerprint of a canvas render — headless SwiftShader and real
     // GPU rasterize text slightly differently, which shows up as a hash
@@ -97,6 +118,13 @@ async () => {
       setTimeout(() => { try { if (f.onload) f.onload(); } catch (e) { finish('err:timeout'); } }, 50);
     } catch (e) { resolve('err:' + e.name); }
   });
+  // Plugin-name realism: every desktop Chrome ships its PDF viewers inside
+  // navigator.plugins. An array with the right *length* but fabricated names
+  // (a length-only spoof) is a known anti-spoof tell.
+  r.pluginNames = (() => {
+    try { return Array.from(navigator.plugins, (p) => p.name); }
+    catch (e) { return 'err:' + e.name; }
+  })();
   // Standard font availability: minimal bot containers ship no fonts, real
   // desktops have Arial/Times/etc (Linux maps them via fontconfig). Metric
   // based detection (same idea as fingerprintjs): the probe font is
@@ -219,6 +247,38 @@ def analyze_report(results: dict) -> dict:
         add("webgl", "WARN", f"unexpected renderer: {gl}", "AMD Radeon")
     add("webglVendor", "PASS" if "AMD" in str(results.get("webglVendor", ""))
         else "WARN", "GPU vendor matches spoofed renderer", "Google Inc. (AMD)")
+    # WebGL2 must agree with WebGL1: modern Chrome always ships WebGL2, and
+    # both contexts expose the same hardware renderer. A spoof that only
+    # patches WebGLRenderingContext.prototype leaks the real (often
+    # SwiftShader) renderer through the WebGL2 context — a classic
+    # partial-spoof tell. This check also proves OUR spoof covers both
+    # prototypes (browser.py patches WebGLRenderingContext.prototype AND
+    # WebGL2RenderingContext.prototype).
+    gl1 = str(results.get("webgl", ""))
+    gl2 = str(results.get("webgl2", ""))
+    if gl2 in ("", "no-webgl2", "no-ext", "err"):
+        add("webgl2", "WARN",
+            f"WebGL2 unavailable ({gl2 or 'empty'}) — modern Chrome always ships it",
+            "same renderer as WebGL1")
+    elif "SwiftShader" in gl2:
+        add("webgl2", "FAIL", "SwiftShader leaks via WebGL2 (WebGL1-only spoof)",
+            "hardware GL")
+    elif "AMD" in gl1 and "AMD" not in gl2:
+        add("webgl2", "FAIL",
+            f"WebGL2 renderer '{gl2[:60]}' doesn't match spoofed WebGL1 — partial spoof leak",
+            "AMD Radeon (consistent with WebGL1)")
+    elif "AMD" in gl2:
+        add("webgl2", "PASS", "WebGL2 renderer matches the spoofed WebGL1 profile",
+            "AMD Radeon")
+    else:
+        add("webgl2", "WARN", f"unexpected WebGL2 renderer: {gl2[:60]}", "AMD Radeon")
+    gv2 = str(results.get("webgl2Vendor", ""))
+    if gv2 and gv2 not in ("no-webgl2", "no-ext", "err"):
+        add("webgl2Vendor", "PASS" if "AMD" in gv2 else "WARN",
+            "GPU vendor consistent on the WebGL2 context too", "Google Inc. (AMD)")
+    else:
+        add("webgl2Vendor", "WARN", f"WebGL2 vendor unavailable ({gv2 or 'empty'})",
+            "Google Inc. (AMD)")
 
     # -- client hints (UA-CH): modern anti-bot checks these for consistency --
     # Real Chrome advertises a "Google Chrome" brand in navigator.userAgentData;
@@ -264,6 +324,27 @@ def analyze_report(results: dict) -> dict:
     # -- warnings: inconsistencies real browsers don't have -----------------
     add("plugins", "FAIL" if results.get("plugins", 0) == 0 else "PASS",
         "headless shell reports 0 plugins", ">= 1")
+    # Plugin-name realism: real desktop Chrome always lists its PDF viewers
+    # (Chrome 149 reports 5 entries, all "…PDF Viewer" variants). A spoofed
+    # array of the right length with fabricated names is a known anti-spoof
+    # check — length alone is not enough.
+    names = results.get("pluginNames")
+    if isinstance(names, list) and names:
+        joined = ", ".join(str(n) for n in names)
+        if "PDF" in joined:
+            add("pluginNames", "PASS",
+                f"plugins include the PDF viewers Chrome ships ({joined[:70]})",
+                "Chrome PDF plugins present")
+        else:
+            add("pluginNames", "WARN",
+                f"{len(names)} plugins, none is a PDF viewer — fabricated plugin list",
+                "Chrome PDF plugins present")
+    elif isinstance(names, list):
+        add("pluginNames", "WARN", "empty plugin list (see plugins check)",
+            "Chrome PDF plugins present")
+    else:
+        add("pluginNames", "WARN", f"cannot read plugin names ({names})",
+            "Chrome PDF plugins present")
     fonts = results.get("fonts")
     if isinstance(fonts, dict) and fonts:
         avail = sum(1 for v in fonts.values() if v)
