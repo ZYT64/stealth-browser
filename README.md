@@ -45,7 +45,8 @@ of *removing* it entirely is what actually passes detection.
 - 💾 **Persistent profiles** — cookies/localStorage survive restarts, so you
   log in once and stay logged in
 - 🔍 **Fingerprint self-check** — local JS checks (webdriver incl. inside
-  iframes, UA-CH consistency, standard font availability, locale/languages
+  iframes, UA-CH consistency, WebGL2-vs-WebGL1 renderer consistency,
+  plugin-name realism, standard font availability, locale/languages
   cross-check, screen plausibility) + optional sannysoft remote scan
 - 🌐 **Configurable** — locale, timezone, viewport, custom UA all exposed
 
@@ -120,6 +121,8 @@ src/stealth_browser/
 | CDP debug port / `$cdc_` marker | ✅ cleared |
 | `deviceMemory` → 8 | ✅ |
 | WebGL renderer → AMD Radeon | ✅ |
+| WebGL2 renderer == WebGL1 renderer (partial-spoof check) | ✅ |
+| Plugin array includes Chrome's PDF viewers (name realism) | ✅ |
 | UA-CH (`userAgentData`) brands → Google Chrome + Chromium | ✅ |
 | UA-CH `uaFullVersion` → matches UA version | ✅ |
 | PhantomJS / Selenium artifacts | ✅ all pass |
