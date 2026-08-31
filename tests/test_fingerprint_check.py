@@ -26,6 +26,13 @@ def _clean_results():
         "chromeRuntime": True,
         "userAgent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36"),
+        # legacy navigator members must agree with the Chrome UA
+        "appVersion": "5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, "
+                       "like Gecko) Chrome/149.0.7827.55 Safari/537.36",
+        "appCodeName": "Mozilla",
+        "product": "Gecko",
+        "productSub": "20030107",
+        "vendor": "Google Inc.",
         "platform": "Linux x86_64",
         "hardwareConcurrency": 8,
         "deviceMemory": 8,
@@ -365,6 +372,78 @@ def test_chrome_internals_are_info():
 # CHECKS — JS payload sanity
 # --------------------------------------------------------------------------
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+# --------------------------------------------------------------------------
+# legacy navigator members (appVersion/appCodeName/product/productSub/vendor)
+# --------------------------------------------------------------------------
+def _leak(overrides):
+    r = _clean_results()
+    r.update(overrides)
+    return analyze_report(r)["checks"]
+
+
+def test_legacy_members_clean_pass():
+    checks = _leak({})
+    assert checks["appVersion"]["status"] == "PASS"
+    assert checks["appCodeName"]["status"] == "PASS"
+    assert checks["product"]["status"] == "PASS"
+    assert checks["productSub"]["status"] == "PASS"
+    assert checks["vendor"]["status"] == "PASS"
+
+
+def test_headless_leak_in_app_version_is_flagged():
+    # headless Chrome leaks HeadlessChrome in appVersion even if the UA is
+    # patched — the classic partial-spoof tell
+    checks = _leak({"appVersion": "5.0 (X11; Linux) "
+                                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                  "HeadlessChrome/149.0.7827.55 Safari/537.36"})
+    assert checks["appVersion"]["status"] == "FAIL"
+
+
+def test_blank_app_version_warns():
+    checks = _leak({"appVersion": ""})
+    assert checks["appVersion"]["status"] == "WARN"
+
+
+def test_wrong_app_code_name_warns():
+    checks = _leak({"appCodeName": "Netscape"})
+    assert checks["appCodeName"]["status"] == "WARN"
+
+
+def test_wrong_product_warns():
+    checks = _leak({"product": ""})
+    assert checks["product"]["status"] == "WARN"
+
+
+def test_missing_product_sub_warns():
+    # productSub being null/'' while on Windows/headless is a known tell
+    checks = _leak({"productSub": ""})
+    assert checks["productSub"]["status"] == "WARN"
+
+
+def test_empty_vendor_warns():
+    checks = _leak({"vendor": ""})
+    assert checks["vendor"]["status"] == "WARN"
+
+
+def test_headless_vendor_leak_fails():
+    checks = _leak({"vendor": "HeadlessChrome"})
+    assert checks["vendor"]["status"] == "FAIL"
+
+
+def test_unexpected_vendor_warns():
+    checks = _leak({"vendor": "Mozilla Foundation"})
+    assert checks["vendor"]["status"] == "WARN"
+
+
+def test_legacy_members_missing_keys_warn_not_crash():
+    r = _clean_results()
+    for k in ("appVersion", "appCodeName", "product", "productSub", "vendor"):
+        del r[k]
+    checks = analyze_report(r)["checks"]
+    for name in ("appVersion", "appCodeName", "product", "productSub", "vendor"):
+        assert checks[name]["status"] == "WARN"
+
+
 def test_checks_js_syntax():
     """The injected JS must at least parse as a valid script."""
     fd, path = tempfile.mkstemp(suffix=".js")
