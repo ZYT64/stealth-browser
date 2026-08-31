@@ -22,6 +22,14 @@ async () => {
   r.chrome = !!window.chrome;
   r.chromeRuntime = !!(window.chrome && window.chrome.runtime && window.chrome.runtime.id !== undefined);
   r.userAgent = navigator.userAgent;
+  // Legacy navigator members: headless Chrome leaks 'HeadlessChrome' here
+  // even when the UA string itself is patched (fingerprintjs & creepjs probe
+  // these separately from userAgent). A robust spoof keeps them consistent.
+  r.appVersion = navigator.appVersion;
+  r.appCodeName = navigator.appCodeName;
+  r.product = navigator.product;
+  r.productSub = navigator.productSub;
+  r.vendor = navigator.vendor;
   r.platform = navigator.platform;
   r.hardwareConcurrency = navigator.hardwareConcurrency;
   r.deviceMemory = navigator.deviceMemory;
@@ -236,6 +244,45 @@ def analyze_report(results: dict) -> dict:
     else:
         add("userAgent", "PASS" if "Chrome/" in str(results.get("userAgent", ""))
             else "WARN", "real Chrome UA", "Chrome/1xx in UA")
+    # Legacy navigator consistency: headless Chrome leaks 'HeadlessChrome'
+    # in appVersion (and a tell-tale '' vendor) even when the UA string alone
+    # is patched. fingerprintjs/creepjs read these members independent of the
+    # userAgent string, so they must agree with the Chrome UA we advertise.
+    av = str(results.get("appVersion", ""))
+    if "HeadlessChrome" in av or "Headless" in av:
+        add("appVersion", "FAIL", f"HeadlessChrome leak in navigator.appVersion: {av[:60]}",
+            "no 'Headless'")
+    elif "Chrome/" in av:
+        add("appVersion", "PASS", "appVersion matches a real Chrome build",
+            "Chrome/1xx in appVersion")
+    else:
+        add("appVersion", "WARN", f"appVersion lacks a Chrome build token: {av[:60]}",
+            "Chrome/1xx in appVersion")
+    # appCodeName/product/productSub/vendor must be the standard web-constant
+    # values a real Chromium ships. Headless spoofs that only patch
+    # navigator.userAgent leave these at their default (or their real) values.
+    acn = str(results.get("appCodeName", ""))
+    add("appCodeName", "PASS" if acn == "Mozilla" else "WARN",
+        f"appCodeName = {acn or 'empty'}", "Mozilla")
+    prod = str(results.get("product", ""))
+    add("product", "PASS" if prod == "Gecko" else "WARN",
+        f"product = {prod or 'empty'}", "Gecko")
+    prodsub = str(results.get("productSub", ""))
+    # Real Chrome reports '20030107'; missing/null is a headless tell.
+    if prodsub in ("", "None", "null", "undefined", "0"):
+        add("productSub", "WARN", f"productSub missing/empty ({prodsub})", "20030107")
+    elif prodsub == "20030107":
+        add("productSub", "PASS", "productSub matches real Chrome", "20030107")
+    else:
+        add("productSub", "WARN", f"unexpected productSub ({prodsub})", "20030107")
+    vend = str(results.get("vendor", ""))
+    if "HeadlessChrome" in vend or vend == "":
+        add("vendor", "FAIL" if "Headless" in vend else "WARN",
+            f"navigator.vendor = {vend or 'empty'}", "Google Inc.")
+    elif vend == "Google Inc.":
+        add("vendor", "PASS", "vendor matches Google Inc.", "Google Inc.")
+    else:
+        add("vendor", "WARN", f"unexpected vendor ({vend})", "Google Inc.")
     gl = str(results.get("webgl", ""))
     if "SwiftShader" in gl:
         add("webgl", "FAIL", "SwiftShader software renderer leak", "hardware GL")
