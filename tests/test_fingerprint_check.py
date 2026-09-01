@@ -26,6 +26,9 @@ def _clean_results():
         "chromeRuntime": True,
         "userAgent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36"),
+        # workers always share the creating document's UA — must match above
+        "workerUserAgent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                             "(KHTML, like Gecko) Chrome/149.0.7827.55 Safari/537.36"),
         # legacy navigator members must agree with the Chrome UA
         "appVersion": "5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, "
                        "like Gecko) Chrome/149.0.7827.55 Safari/537.36",
@@ -68,6 +71,13 @@ def _clean_results():
         "screenColorDepth": 24,
         "chromeCsi": True,
         "chromeLoadTimes": True,
+        # extended surface probes (audio fingerprint, worker, WebRTC)
+        "audioFingerprint": "3a7f9c2b",
+        "audioSampleRate": 48000,
+        "audioAllZeros": False,
+        "workerWebdriver": None,
+        "webrtcLeak": {"status": "done", "mdns": 3, "privateIp": 0,
+                        "publicIp": 1, "other": 0, "total": 4},
     }
 
 
@@ -179,6 +189,12 @@ def test_new_checks_missing_keys_warn_not_crash():
     assert a["checks"]["webgl2"]["status"] == "WARN"
     assert a["checks"]["webgl2Vendor"]["status"] == "WARN"
     assert a["checks"]["pluginNames"]["status"] == "WARN"
+    assert a["checks"]["audioFingerprint"]["status"] == "WARN"
+    assert a["checks"]["audioSampleRate"]["status"] == "WARN"
+    assert a["checks"]["workerUserAgent"]["status"] == "WARN"
+    assert a["checks"]["webrtcLeak"]["status"] == "WARN"
+    # webdriver-family checks treat None as clean absence (same as iframe)
+    assert a["checks"]["workerWebdriver"]["status"] == "PASS"
 
 
 # --------------------------------------------------------------------------
@@ -369,6 +385,119 @@ def test_chrome_internals_are_info():
 
 
 # --------------------------------------------------------------------------
+# analyze_report — extended surface probes (audio fingerprint / worker / WebRTC)
+# --------------------------------------------------------------------------
+def test_audio_fingerprint_clean_passes():
+    a = analyze_report(_clean_results())
+    assert a["checks"]["audioFingerprint"]["status"] == "PASS"
+    assert a["checks"]["audioSampleRate"]["status"] == "PASS"
+
+
+def test_audio_all_zeros_is_flagged():
+    """All-zero render = degenerate/soft audio stack — a bot signal."""
+    r = _clean_results()
+    r["audioAllZeros"] = True
+    a = analyze_report(r)
+    assert a["checks"]["audioFingerprint"]["status"] == "FAIL"
+    assert a["summary"]["verdict"] == "flagged"
+
+
+def test_no_audio_warns():
+    r = _clean_results()
+    r["audioFingerprint"] = "no-audio"
+    a = analyze_report(r)
+    assert a["checks"]["audioFingerprint"]["status"] == "WARN"
+    assert a["summary"]["verdict"] == "attention"
+
+
+def test_unusual_sample_rate_warns():
+    r = _clean_results()
+    r["audioSampleRate"] = 8000
+    a = analyze_report(r)
+    assert a["checks"]["audioSampleRate"]["status"] == "WARN"
+
+
+def test_worker_webdriver_leak_is_flagged():
+    r = _clean_results()
+    r["workerWebdriver"] = True
+    a = analyze_report(r)
+    assert a["checks"]["workerWebdriver"]["status"] == "FAIL"
+    assert a["summary"]["verdict"] == "flagged"
+
+
+def test_worker_webdriver_string_true_is_flagged():
+    r = _clean_results()
+    r["workerWebdriver"] = "true"
+    a = analyze_report(r)
+    assert a["checks"]["workerWebdriver"]["status"] == "FAIL"
+
+
+def test_worker_webdriver_unverifiable_warns():
+    r = _clean_results()
+    r["workerWebdriver"] = "timeout"
+    a = analyze_report(r)
+    assert a["checks"]["workerWebdriver"]["status"] == "WARN"
+    assert a["summary"]["verdict"] == "attention"
+
+
+def test_worker_ua_mismatch_is_flagged():
+    """A UA spoof that misses workers leaks the real UA in worker context."""
+    r = _clean_results()
+    r["workerUserAgent"] = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                             "(KHTML, like Gecko) HeadlessChrome/149.0 Safari/537.36")
+    a = analyze_report(r)
+    assert a["checks"]["workerUserAgent"]["status"] == "FAIL"
+    assert a["summary"]["verdict"] == "flagged"
+
+
+def test_worker_ua_missing_warns():
+    r = _clean_results()
+    del r["workerUserAgent"]
+    a = analyze_report(r)
+    assert a["checks"]["workerUserAgent"]["status"] == "WARN"
+
+
+def test_webrtc_raw_private_ip_is_flagged():
+    """Raw RFC1918 IPs in ICE candidates expose the real local IP."""
+    r = _clean_results()
+    r["webrtcLeak"] = {"status": "done", "mdns": 0, "privateIp": 2,
+                       "publicIp": 0, "other": 0, "total": 2}
+    a = analyze_report(r)
+    assert a["checks"]["webrtcLeak"]["status"] == "FAIL"
+    assert a["summary"]["verdict"] == "flagged"
+
+
+def test_webrtc_mdns_candidates_pass():
+    """mDNS-obfuscated host candidates = Chrome's privacy default working."""
+    r = _clean_results()
+    r["webrtcLeak"] = {"status": "done", "mdns": 2, "privateIp": 0,
+                       "publicIp": 0, "other": 0, "total": 2}
+    a = analyze_report(r)
+    assert a["checks"]["webrtcLeak"]["status"] == "PASS"
+
+
+def test_webrtc_missing_warns():
+    r = _clean_results()
+    del r["webrtcLeak"]
+    a = analyze_report(r)
+    assert a["checks"]["webrtcLeak"]["status"] == "WARN"
+
+
+def test_webrtc_no_rtcpeerconnection_warns():
+    r = _clean_results()
+    r["webrtcLeak"] = {"status": "no-webrtc"}
+    a = analyze_report(r)
+    assert a["checks"]["webrtcLeak"]["status"] == "WARN"
+
+
+def test_webrtc_error_status_warns():
+    r = _clean_results()
+    r["webrtcLeak"] = {"status": "err:NotSupportedError"}
+    a = analyze_report(r)
+    assert a["checks"]["webrtcLeak"]["status"] == "WARN"
+
+
+# --------------------------------------------------------------------------
 # CHECKS — JS payload sanity
 # --------------------------------------------------------------------------
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
@@ -485,7 +614,11 @@ def test_checks_js_executes_without_reference_errors():
       if (!('webdriver' in r) || !('canvas' in r) || !('permissions' in r)
           || !('iframeWebdriver' in r) || !('fonts' in r)
           || !('webgl2' in r) || !('webgl2Vendor' in r)
-          || !('pluginNames' in r)) {
+          || !('pluginNames' in r)
+          || !('audioFingerprint' in r) || !('audioSampleRate' in r)
+          || !('audioAllZeros' in r)
+          || !('workerWebdriver' in r) || !('workerUserAgent' in r)
+          || !('webrtcLeak' in r)) {
         throw new Error('missing keys: ' + Object.keys(r));
       }
       if (r.permissions !== 'prompt') throw new Error('permissions: ' + r.permissions);
