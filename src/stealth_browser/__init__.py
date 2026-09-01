@@ -7,6 +7,7 @@ from .browser import (
     human_scroll,
     human_move,
     human_type,
+    human_fill_form,
 )
 
 __version__ = "0.2.0"
@@ -17,4 +18,5 @@ __all__ = [
     "human_scroll",
     "human_move",
     "human_type",
+    "human_fill_form",
 ]
