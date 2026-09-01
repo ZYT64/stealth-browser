@@ -17,6 +17,7 @@ import pytest
 from stealth_browser.browser import (
     human_click,
     human_delay,
+    human_fill_form,
     human_move,
     human_scroll,
     human_type,
@@ -50,9 +51,13 @@ class _FakeMouse:
 class _FakeKeyboard:
     def __init__(self):
         self.typed = []
+        self.presses = []
 
     async def type(self, ch):
         self.typed.append(ch)
+
+    async def press(self, key):
+        self.presses.append(key)
 
 
 class _FakePage:
@@ -90,6 +95,47 @@ async def test_human_type_chars():
     assert getattr(page, "clicked", None) == "input#q"
     # each character is typed individually, in order
     assert page.keyboard.typed == ["h", "i"]
+
+
+# --------------------------------------------------------------------------
+# human_fill_form (multi-field form filling)
+# --------------------------------------------------------------------------
+async def test_human_fill_form_types_fields_in_order():
+    page = _FakePageWithLocator()
+    await human_fill_form(page, [("input#name", "Neo"),
+                                 ("input#email", "x@y.z")])
+    # all characters typed, in field order, into the shared keyboard stream
+    assert "".join(page.keyboard.typed) == "Neox@y.z"
+    # ended focused on the last field (click-to-focus path ran for each)
+    assert page.located == "input#email"
+    assert page.mouse.downs == 2 and page.mouse.ups == 2  # one click per field
+
+
+async def test_human_fill_form_clears_before_typing():
+    """clear=True wipes each field the way a keyboard user does — select-all
+    then Backspace — before the new text is typed, never an instant fill."""
+    page = _FakePageWithLocator()
+    await human_fill_form(page, [("input#name", "Neo")])
+    assert page.keyboard.presses == ["ControlOrMeta+a", "Backspace"]
+    # clearing happened BEFORE the new text went in
+    assert "".join(page.keyboard.typed) == "Neo"
+
+
+async def test_human_fill_form_clear_false_skips_wipe():
+    page = _FakePageWithLocator()
+    await human_fill_form(page, [("input#name", "Neo")], clear=False)
+    assert page.keyboard.presses == []
+    assert "".join(page.keyboard.typed) == "Neo"
+
+
+async def test_human_fill_form_empty_text_leaves_field_untouched():
+    """A field with empty text is focused (cursor continuity) but neither
+    cleared nor typed into."""
+    page = _FakePageWithLocator()
+    await human_fill_form(page, [("input#name", "Neo"), ("input#note", "")])
+    assert page.located == "input#note"
+    assert page.keyboard.presses == ["ControlOrMeta+a", "Backspace"]  # name only
+    assert "".join(page.keyboard.typed) == "Neo"
 
 
 # --------------------------------------------------------------------------
