@@ -41,7 +41,8 @@ of *removing* it entirely is what actually passes detection.
   build number — both are bot tells)
 - 🖱️ **Human-like interaction** — randomized delays, progressive scrolling
   with occasional backtracks, ease-in-out curved mouse paths, type character
-  by character
+  by character, multi-field form filling with human-style clears and
+  inter-field pacing
 - 💾 **Persistent profiles** — cookies/localStorage survive restarts, so you
   log in once and stay logged in
 - 🔍 **Fingerprint self-check** — local JS checks (webdriver incl. inside
@@ -66,6 +67,10 @@ pip install -e ".[core]"
 # 1. Verify the anti-fingerprint profile (local checks)
 stealth-browser check
 
+# Exit code is 1 when the verdict is "flagged" (any hard FAIL) — usable in
+# CI/scripts. WARNs ("attention") still exit 0.
+stealth-browser check && echo "profile clean"
+
 # JSON report written to a custom path (default: ~/.stealth-browser/fingerprint-*.json)
 stealth-browser check --out /tmp/report.json
 
@@ -86,7 +91,7 @@ stealth-browser snapshot <url> [--profile NAME] [--out FILE]
 
 ```python
 import asyncio
-from stealth_browser.browser import open_browser, apply_stealth, human_scroll, human_type
+from stealth_browser.browser import open_browser, apply_stealth, human_scroll, human_type, human_fill_form
 
 async def main():
     p, browser, ctx, profile_dir = await open_browser("my-profile")
@@ -95,6 +100,13 @@ async def main():
     await apply_stealth(page)  # re-apply spoof in main world (see below)
     await human_scroll(page)
     await human_type(page, "input[name=q]", "hello world")
+    # Fill a multi-field form like a person: curved-click focus, select-all
+    # + Backspace clears, per-key delays, randomized inter-field pauses
+    await human_fill_form(page, [
+        ("input#name", "Neo Lirael"),
+        ("input#email", "me@example.com"),
+        ("textarea#message", "Hello, this is a real message."),
+    ])
     # ... do work, then:
     await browser.close()
     await p.stop()
