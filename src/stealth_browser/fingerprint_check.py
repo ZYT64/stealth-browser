@@ -155,6 +155,131 @@ async () => {
       return out;
     } catch (e) { return 'err:' + e.name; }
   })();
+  // AudioContext fingerprint: the third classic fingerprint surface after
+  // canvas and WebGL. fingerprintjs/creepjs render an oscillator through a
+  // DynamicsCompressor and hash the output; headless/soft-audio stacks
+  // produce degenerate (all-zero) or missing results, and the sample rate
+  // is a hardware-consistency signal. A spoof that patches canvas but not
+  // WebAudio is a classic partial-spoof tell.
+  r.audioSampleRate = null;
+  r.audioAllZeros = false;
+  r.audioFingerprint = await (async () => {
+    try {
+      const Ctx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+      if (!Ctx) return 'no-audio';
+      const actx = new Ctx(1, 44100, 44100);
+      const osc = actx.createOscillator();
+      osc.type = 'triangle';
+      osc.frequency.value = 10000;
+      const comp = actx.createDynamicsCompressor();
+      comp.threshold.value = -50;
+      comp.knee.value = 40;
+      comp.ratio.value = 12;
+      comp.attack.value = 0;
+      comp.release.value = 0.25;
+      osc.connect(comp);
+      comp.connect(actx.destination);
+      osc.start(0);
+      const buf = await actx.startRendering();
+      const ch = buf.getChannelData(0);
+      let allZeros = true;
+      let h = 5381;
+      for (let i = 4500; i < 5000; i++) {
+        if (ch[i] !== 0) allZeros = false;
+        h = ((h << 5) + h + Math.round(ch[i] * 1e6)) >>> 0;
+      }
+      r.audioAllZeros = allZeros;
+      r.audioSampleRate = actx.sampleRate;
+      return h.toString(16);
+    } catch (e) { return 'err:' + e.name; }
+  })();
+  // Web Worker context probe: anti-bot patches that only cover the main
+  // world leak inside workers, where the page gets a fresh navigator.
+  // fingerprintjs probes worker-scoped values for exactly this reason. We
+  // check both webdriver and the UA string (a UA spoof that misses workers
+  // leaks the headless UA there). Blob-URL workers work on any origin.
+  r.workerWebdriver = null;
+  r.workerUserAgent = null;
+  await new Promise((resolve) => {
+    try {
+      if (typeof Worker === 'undefined') {
+        r.workerWebdriver = 'no-worker';
+        resolve();
+        return;
+      }
+      const src = "postMessage({wd: navigator.webdriver, ua: navigator.userAgent});";
+      const url = URL.createObjectURL(new Blob([src], {type: 'application/javascript'}));
+      const w = new Worker(url);
+      let done = false;
+      const finish = (wd, ua) => {
+        if (done) return;
+        done = true;
+        try { w.terminate(); } catch (e) {}
+        try { URL.revokeObjectURL(url); } catch (e) {}
+        r.workerWebdriver = wd === undefined ? null : String(wd);
+        r.workerUserAgent = ua === undefined ? null : String(ua);
+        resolve();
+      };
+      w.onmessage = (ev) => {
+        try {
+          const d = ev.data || {};
+          finish(d.wd, d.ua);
+        } catch (e) {
+          if (!done) { r.workerWebdriver = 'err:' + e.name; finish(); }
+        }
+      };
+      w.onerror = () => { if (!done) r.workerWebdriver = 'err:worker'; finish(); };
+      setTimeout(() => {
+        if (!done && r.workerWebdriver === null) r.workerWebdriver = 'timeout';
+        finish();
+      }, 1500);
+    } catch (e) {
+      r.workerWebdriver = 'err:' + e.name;
+      resolve();
+    }
+  });
+  // WebRTC leak probe: a data-channel peer connection gathers ICE candidates
+  // even with no remote peer. Chrome's privacy default hides local IPs
+  // behind mDNS (.local) hostnames; raw RFC1918 IPs in host candidates mean
+  // the real machine IP is exposed to page scripts — behind a proxy that is
+  // an IP-consistency leak anti-bot systems actively probe for. We report
+  // bucket counts only (never raw candidate strings) so the JSON report
+  // stays safe to share.
+  r.webrtcLeak = await new Promise((resolve) => {
+    try {
+      if (typeof RTCPeerConnection === 'undefined') {
+        resolve({status: 'no-webrtc'});
+        return;
+      }
+      const pc = new RTCPeerConnection({});
+      const found = [];
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        try { pc.close(); } catch (e) {}
+        let mdns = 0, privateIp = 0, publicIp = 0, other = 0;
+        const rePrivate = /\b(192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|169\.254\.\d+\.\d+)\b/;
+        for (const c of found) {
+          if (/\.local\b/.test(c)) mdns++;
+          else if (rePrivate.test(c)) privateIp++;
+          else if (/typ srflx|typ prflx|typ relay/.test(c)) publicIp++;
+          else other++;
+        }
+        resolve({status: 'done', mdns, privateIp, publicIp, other, total: found.length});
+      };
+      pc.createDataChannel('probe');
+      pc.onicecandidate = (ev) => {
+        if (done) return;
+        try {
+          if (!ev.candidate) finish();
+          else found.push(String(ev.candidate.candidate || ''));
+        } catch (e) { found.push('parse-err'); }
+      };
+      pc.createOffer().then((o) => pc.setLocalDescription(o)).catch(() => {});
+      setTimeout(finish, 2000);
+    } catch (e) { resolve({status: 'err:' + e.name}); }
+  });
   try {
     r.screenWidth = screen.width;
     r.screenHeight = screen.height;
@@ -326,6 +451,77 @@ def analyze_report(results: dict) -> dict:
     else:
         add("webgl2Vendor", "WARN", f"WebGL2 vendor unavailable ({gv2 or 'empty'})",
             "Google Inc. (AMD)")
+
+    # -- extended surface probes: audio fingerprint, worker context, WebRTC -
+    # Audio fingerprint: WebAudio is the third classic fingerprint surface
+    # (canvas, WebGL, audio). Degenerate (all-zero) renders or a missing
+    # WebAudio stack are bot signals; the hash itself is informational.
+    afp = results.get("audioFingerprint")
+    if afp is None:
+        add("audioFingerprint", "WARN", "audio fingerprint unavailable (missing)",
+            "non-degenerate render")
+    elif str(afp) == "no-audio" or str(afp).startswith("err:"):
+        add("audioFingerprint", "WARN", f"WebAudio unavailable ({afp})",
+            "non-degenerate render")
+    elif results.get("audioAllZeros"):
+        add("audioFingerprint", "FAIL",
+            "audio render is all-zero — degenerate/soft audio stack",
+            "non-degenerate render")
+    else:
+        add("audioFingerprint", "PASS", f"audio fingerprint captured ({afp})",
+            "non-degenerate render")
+    sr = results.get("audioSampleRate")
+    if sr in (44100, 48000):
+        add("audioSampleRate", "PASS", f"sample rate {sr} Hz (typical desktop)",
+            "44100|48000")
+    elif sr is None:
+        add("audioSampleRate", "WARN", "sample rate unavailable", "44100|48000")
+    else:
+        add("audioSampleRate", "WARN", f"unusual sample rate {sr} Hz", "44100|48000")
+    # Worker context: patches that only cover the main world leak inside
+    # Web Workers (a fresh navigator object). Same None-is-clean convention
+    # as the iframe webdriver check (verified absence, not missing data).
+    wwd = results.get("workerWebdriver")
+    if wwd is None or str(wwd).lower() == "false":
+        add("workerWebdriver", "PASS", "webdriver absent inside Web Workers too", "absent")
+    elif wwd is True or str(wwd).lower() == "true":
+        add("workerWebdriver", "FAIL", f"worker leaks webdriver={wwd}", "absent")
+    else:
+        add("workerWebdriver", "WARN", f"cannot verify worker webdriver ({wwd})", "absent")
+    # Workers always share the creating document's UA — a mismatch means a
+    # UA spoof that does not cover the worker scope (headless UA leak).
+    wua = results.get("workerUserAgent")
+    mua = str(results.get("userAgent", ""))
+    if wua is None:
+        add("workerUserAgent", "WARN", "worker UA unavailable", "matches main frame UA")
+    elif str(wua) == mua:
+        add("workerUserAgent", "PASS", "worker UA matches the main frame", "matches main frame UA")
+    else:
+        add("workerUserAgent", "FAIL",
+            f"worker UA differs from main frame — worker-scope spoof leak ({str(wua)[:60]})",
+            "matches main frame UA")
+    # WebRTC: raw local IPs in ICE candidates are an IP-consistency leak
+    # (the real machine IP readable by page scripts, e.g. behind a proxy).
+    wrtc = results.get("webrtcLeak")
+    if wrtc is None:
+        add("webrtcLeak", "WARN", "WebRTC probe unavailable (missing)", "no raw local IPs")
+    elif not isinstance(wrtc, dict):
+        add("webrtcLeak", "WARN", f"WebRTC probe result unreadable ({wrtc})", "no raw local IPs")
+    elif str(wrtc.get("status", "")).startswith("err"):
+        add("webrtcLeak", "WARN", f"WebRTC probe failed ({wrtc.get('status')})", "no raw local IPs")
+    elif wrtc.get("status") == "no-webrtc":
+        add("webrtcLeak", "WARN", "RTCPeerConnection missing — unusual for real Chrome",
+            "present but protected")
+    elif wrtc.get("privateIp", 0):
+        add("webrtcLeak", "FAIL",
+            f"{wrtc.get('privateIp')} raw private IP(s) in ICE candidates — "
+            "local IP exposed to page scripts",
+            "mDNS-obfuscated or no local candidates")
+    else:
+        add("webrtcLeak", "PASS",
+            f"no raw local IPs leaked ({wrtc.get('mdns', 0)} mDNS, "
+            f"{wrtc.get('publicIp', 0)} reflexive, {wrtc.get('other', 0)} other)",
+            "no raw local IPs")
 
     # -- client hints (UA-CH): modern anti-bot checks these for consistency --
     # Real Chrome advertises a "Google Chrome" brand in navigator.userAgentData;
