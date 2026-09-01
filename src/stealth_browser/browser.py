@@ -246,9 +246,58 @@ async def human_type(page, selector: str, text: str) -> None:
     teleport) before typing.
     """
     await human_click(page, selector)
+    await _human_type_text(page, text)
+
+
+async def _human_type_text(page, text: str) -> None:
+    """Type text character-by-character with random inter-key delays.
+
+    Shared typing engine for human_type and human_fill_form; assumes the
+    target field already has focus (human_click took care of it).
+    """
     for ch in text:
         await page.keyboard.type(ch)
         await asyncio.sleep(random.uniform(0.03, 0.12))
+
+
+async def human_fill_form(page, fields, *, clear: bool = True,
+                          field_pause=(0.5, 1.8)) -> None:
+    """Fill a sequence of form fields the way a person works through a form.
+
+    Real form automation is a *sequence* of fields, and scripts that focus
+    each input instantly and fill them with zero inter-field delay look
+    nothing like a human filling a signup or contact form. ``fields`` is an
+    iterable of ``(selector, text)`` pairs, filled one at a time:
+
+    1. focus each field with a human-like click (same curved cursor approach
+       as human_click — never a teleport),
+    2. when ``clear`` and there is text to type, wipe existing content the
+       way a keyboard user does (select-all + Backspace, not an instant
+       ``fill("\u200b")``),
+    3. type the text character-by-character with random inter-key delays,
+    4. pause between fields like someone reading the next label — usually
+       ``field_pause`` seconds, occasionally (~15%) a longer 0.8–2.2s
+       "thinking" pause on top.
+
+    Fields whose text is empty are focused but left untouched (no clear, no
+    typing) — useful to move the cursor through the form without modifying
+    those inputs. Intended for text inputs and textareas; not for <select>
+    or checkbox/radio controls (use human_click for those).
+    """
+    fields = list(fields)
+    for i, (selector, text) in enumerate(fields):
+        await human_click(page, selector)
+        if clear and text:
+            await page.keyboard.press("ControlOrMeta+a")
+            await asyncio.sleep(random.uniform(0.05, 0.15))
+            await page.keyboard.press("Backspace")
+            await asyncio.sleep(random.uniform(0.1, 0.3))
+        await _human_type_text(page, text)
+        if i < len(fields) - 1:
+            pause = random.uniform(*field_pause)
+            if random.random() < 0.15:  # occasionally re-reads the next label
+                pause += random.uniform(0.8, 2.2)
+            await asyncio.sleep(pause)
 
 
 async def human_scroll(page, steps: int | None = None, pause=(0.3, 0.9)) -> None:
@@ -342,6 +391,11 @@ async def cmd_check(args) -> None:
 
     await browser.close()
     await p.stop()
+    # `check` is a verification command, so its exit code is usable in CI and
+    # scripts: only a "flagged" verdict (at least one hard FAIL) exits 1.
+    # WARNs (verdict "attention") still exit 0.
+    if analysis["summary"]["verdict"] == "flagged":
+        raise SystemExit(1)
 
 
 async def cmd_dump(args) -> None:
