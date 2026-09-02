@@ -78,6 +78,14 @@ def _clean_results():
         "workerWebdriver": None,
         "webrtcLeak": {"status": "done", "mdns": 3, "privateIp": 0,
                         "publicIp": 1, "other": 0, "total": 4},
+        # native toString consistency (spoof-source leak probes): every
+        # injected function must stringify to native-looking code
+        "fnToStringSelf": "function toString() { [native code] }",
+        "webglToString": "function getParameter() { [native code] }",
+        "webgl2ToString": "function getParameter() { [native code] }",
+        "deviceMemoryGetter": "function get deviceMemory() { [native code] }",
+        "uaDataGetter": "function get userAgentData() { [native code] }",
+        "uaDataHenv": "function getHighEntropyValues() { [native code] }",
     }
 
 
@@ -498,6 +506,109 @@ def test_webrtc_error_status_warns():
 
 
 # --------------------------------------------------------------------------
+# analyze_report — native toString consistency (spoof-source leaks)
+# --------------------------------------------------------------------------
+def test_webgl_tostring_leak_is_flagged():
+    """A patched getParameter still showing its JS source is an instant tell:
+    the source contains the hardcoded vendor id and renderer constants."""
+    r = _clean_results()
+    r["webglToString"] = ("function(p) { if (p === 37445) return 'Google Inc. (AMD)'; "
+                          "if (p === 37446) return 'ANGLE (AMD, AMD Radeon ...'; "
+                          "return orig.call(this, p); }")
+    a = analyze_report(r)
+    assert a["checks"]["webglToString"]["status"] == "FAIL"
+    assert a["summary"]["verdict"] == "flagged"
+
+
+def test_webgl2_tostring_leak_is_flagged():
+    r = _clean_results()
+    r["webgl2ToString"] = ("p => p === 37446 ? 'ANGLE (AMD, AMD Radeon Graphics)' "
+                           ": orig(p)")
+    a = analyze_report(r)
+    assert a["checks"]["webgl2ToString"]["status"] == "FAIL"
+    assert a["summary"]["verdict"] == "flagged"
+
+
+def test_fn_tostring_shim_leak_is_flagged():
+    """A toString shim whose own source leaks is worse than no shim: it
+    proves Function.prototype was tampered with."""
+    r = _clean_results()
+    r["fnToStringSelf"] = ("function toString() { if (spoofedFns.has(this)) "
+                           "return 'function ' + name + '() { [native code] }'; }")
+    a = analyze_report(r)
+    assert a["checks"]["fnToStringSelf"]["status"] == "FAIL"
+    assert a["summary"]["verdict"] == "flagged"
+
+
+def test_device_memory_getter_arrow_leak_is_flagged():
+    r = _clean_results()
+    r["deviceMemoryGetter"] = "() => 8"
+    a = analyze_report(r)
+    assert a["checks"]["deviceMemoryGetter"]["status"] == "FAIL"
+    assert a["summary"]["verdict"] == "flagged"
+
+
+def test_uad_henv_leak_is_flagged():
+    r = _clean_results()
+    r["uaDataHenv"] = "() => Promise.resolve({uaFullVersion: '149.0.7827.55'})"
+    a = analyze_report(r)
+    assert a["checks"]["uaDataHenv"]["status"] == "FAIL"
+    assert a["summary"]["verdict"] == "flagged"
+
+
+def test_tostring_probes_missing_warn_not_crash():
+    """Old payloads without the toString keys degrade to WARN, never raise."""
+    r = _clean_results()
+    for k in ("fnToStringSelf", "webglToString", "webgl2ToString",
+              "deviceMemoryGetter", "uaDataGetter", "uaDataHenv"):
+        del r[k]
+    a = analyze_report(r)
+    for k in ("fnToStringSelf", "webglToString", "webgl2ToString",
+              "deviceMemoryGetter", "uaDataGetter", "uaDataHenv"):
+        assert a["checks"][k]["status"] == "WARN"
+    assert a["summary"]["verdict"] == "attention"
+
+
+def test_tostring_probe_errors_warn_not_crash():
+    r = _clean_results()
+    for k in ("fnToStringSelf", "webglToString", "webgl2ToString",
+              "deviceMemoryGetter", "uaDataGetter", "uaDataHenv"):
+        r[k] = "err:TypeError"
+    a = analyze_report(r)
+    for k in ("fnToStringSelf", "webglToString", "webgl2ToString",
+              "deviceMemoryGetter", "uaDataGetter", "uaDataHenv"):
+        assert a["checks"][k]["status"] == "WARN"
+
+
+def test_device_memory_getter_absent_warns():
+    """No own-property getter = the spoof never ran in this page."""
+    r = _clean_results()
+    r["deviceMemoryGetter"] = "no-own-prop"
+    a = analyze_report(r)
+    assert a["checks"]["deviceMemoryGetter"]["status"] == "WARN"
+    assert a["summary"]["verdict"] == "attention"
+
+
+def test_webgl_tostring_unavailable_warns():
+    r = _clean_results()
+    r["webglToString"] = "no-webgl1"
+    r["webgl2ToString"] = "no-webgl2"
+    a = analyze_report(r)
+    assert a["checks"]["webglToString"]["status"] == "WARN"
+    assert a["checks"]["webgl2ToString"]["status"] == "WARN"
+
+
+def test_tostring_probes_clean_pass():
+    a = analyze_report(_clean_results())
+    assert a["checks"]["fnToStringSelf"]["status"] == "PASS"
+    assert a["checks"]["webglToString"]["status"] == "PASS"
+    assert a["checks"]["webgl2ToString"]["status"] == "PASS"
+    assert a["checks"]["deviceMemoryGetter"]["status"] == "PASS"
+    assert a["checks"]["uaDataGetter"]["status"] == "PASS"
+    assert a["checks"]["uaDataHenv"]["status"] == "PASS"
+
+
+# --------------------------------------------------------------------------
 # CHECKS — JS payload sanity
 # --------------------------------------------------------------------------
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
@@ -573,6 +684,20 @@ def test_legacy_members_missing_keys_warn_not_crash():
         assert checks[name]["status"] == "WARN"
 
 
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_checks_js_regex_escapes_intact():
+    """CHECKS embeds JS regexes — Python escape processing must not touch them.
+
+    Regression: in a plain (non-raw) Python string \\b silently becomes a
+    BACKSPACE character, which is a *legal* JS regex token that matches a
+    literal backspace instead of a word boundary — corrupting the WebRTC
+    private-IP detection so it never matched (leaks passed as clean).
+    """
+    assert "\x08" not in CHECKS
+    assert "\\b(192" in CHECKS  # literal backslash-b in the private-IP regex
+    assert "\\.local\\b" in CHECKS  # mDNS candidate filter too
+
+
 def test_checks_js_syntax():
     """The injected JS must at least parse as a valid script."""
     fd, path = tempfile.mkstemp(suffix=".js")
@@ -618,7 +743,10 @@ def test_checks_js_executes_without_reference_errors():
           || !('audioFingerprint' in r) || !('audioSampleRate' in r)
           || !('audioAllZeros' in r)
           || !('workerWebdriver' in r) || !('workerUserAgent' in r)
-          || !('webrtcLeak' in r)) {
+          || !('webrtcLeak' in r)
+          || !('fnToStringSelf' in r) || !('webglToString' in r)
+          || !('webgl2ToString' in r) || !('deviceMemoryGetter' in r)
+          || !('uaDataGetter' in r) || !('uaDataHenv' in r)) {
         throw new Error('missing keys: ' + Object.keys(r));
       }
       if (r.permissions !== 'prompt') throw new Error('permissions: ' + r.permissions);
