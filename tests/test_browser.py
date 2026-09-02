@@ -8,8 +8,12 @@ Run:
     pytest -q
 """
 import asyncio
+import os
 import random
 import re
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -237,6 +241,43 @@ async def test_human_move_continues_from_last_position():
     # start of the second path must be near (300, 300) — the remembered end
     # of the first path (jitter budget ±6, scaled down on the first step)
     assert abs(x0 - 300) <= 8 and abs(y0 - 300) <= 8
+
+
+# --------------------------------------------------------------------------
+# STEALTH_INIT — spoof script sanity (no browser needed)
+# --------------------------------------------------------------------------
+def test_stealth_init_registers_tostring_shim():
+    """Spoofed natives must survive Function.prototype.toString probing.
+
+    A patched getParameter whose JS source (with the hardcoded vendor
+    constants) survives a toString call is the classic creepjs-style tell,
+    so the spoof must ship a toString shim and register every injected
+    function with it.
+    """
+    from stealth_browser.browser import STEALTH_INIT
+
+    assert "Function.prototype.toString" in STEALTH_INIT
+    assert "makeNative" in STEALTH_INIT
+    assert "[native code]" in STEALTH_INIT
+    # every injection point must be routed through makeNative
+    assert STEALTH_INIT.count("makeNative(") >= 6  # shim + deviceMemory
+    # + 2x getParameter + userAgentData getter(s) + henv + toJSON
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_stealth_init_js_syntax():
+    """STEALTH_INIT must parse as a valid script (it is an IIFE statement)."""
+    from stealth_browser.browser import STEALTH_INIT
+
+    fd, path = tempfile.mkstemp(suffix=".js")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(STEALTH_INIT + "\n")
+        r = subprocess.run(["node", "--check", path],
+                           capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+    finally:
+        os.unlink(path)
 
 
 # --------------------------------------------------------------------------
