@@ -43,6 +43,14 @@ REAL_UA = (
 # is itself a marker). Written as a single IIFE *expression* so it works
 # both as an init script and via page.evaluate (see apply_stealth).
 #
+# Native toString consistency: every function the spoof injects (the WebGL
+# getParameter patches, the deviceMemory/userAgentData getters, the UA-CH
+# methods) is registered with a Function.prototype.toString shim so it
+# stringifies to `function <name>() { [native code] }`. A patched native
+# whose JS source (with the hardcoded vendor constants inside) survives a
+# toString probe is the classic creepjs-style spoof tell — a spoof that
+# only rewrites behaviour but not its own description is instantly found.
+#
 # UA-CH (Client Hints) consistency: real Chrome advertises a "Google Chrome"
 # brand (plus Chromium and a greased brand) and a uaFullVersion equal to the
 # UA's full version; the headless build reports only "Chromium" and a stale
@@ -52,14 +60,45 @@ REAL_UA = (
 # can never drift from the UA we advertise.
 STEALTH_INIT_TMPL = """
 (() => {
-  Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
+  // Native-consistent toString: anti-bot libraries (creepjs and friends)
+  // call Function.prototype.toString on native-looking methods to expose
+  // spoofs — a patched getParameter that still shows its JS source (with
+  // the hardcoded vendor constants inside) is an instant tell. Every
+  // function we inject is registered with makeNative(); the shim reports
+  // `function <name>() { [native code] }` for exactly those and delegates
+  // to the original toString for everything else (page code unaffected).
+  // Re-running this script (init script + apply_stealth) is safe: each run
+  // wraps the previous toString and re-registers its own functions, and
+  // delegation through the captured shim keeps earlier registrations.
+  const spoofedFns = new WeakSet();
+  const spoofedNames = new WeakMap();
+  const nativeToString = Function.prototype.toString;
+  const makeNative = (fn, name) => {
+    try {
+      spoofedFns.add(fn);
+      spoofedNames.set(fn, name || fn.name || '');
+    } catch (e) {}
+    return fn;
+  };
+  const toStringShim = function toString() {
+    if (spoofedFns.has(this)) {
+      return 'function ' + (spoofedNames.get(this) || this.name || '')
+        + '() { [native code] }';
+    }
+    return nativeToString.call(this);
+  };
+  Function.prototype.toString = makeNative(toStringShim, 'toString');
+
+  Object.defineProperty(navigator, 'deviceMemory',
+    {get: makeNative(() => 8, 'get deviceMemory'), configurable: true});
   const spoof = (proto) => {
     const orig = proto.getParameter;
-    proto.getParameter = function(p) {
+    const patched = function getParameter(p) {
       if (p === 37445) return 'Google Inc. (AMD)';
       if (p === 37446) return 'ANGLE (AMD, AMD Radeon Graphics (RADV VEGA10) Direct3D11 vs_5_0 ps_5_0, D3D11)';
       return orig.call(this, p);
     };
+    proto.getParameter = makeNative(patched, 'getParameter');
   };
   try { spoof(WebGLRenderingContext.prototype); } catch(e) {}
   try { spoof(WebGL2RenderingContext.prototype); } catch(e) {}
@@ -67,6 +106,8 @@ STEALTH_INIT_TMPL = """
   // expose userAgentData at all, and on real pages it lives either on the
   // navigator instance or its prototype. Defining on the instance shadows
   // a prototype getter; falling back to the prototype covers the rest.
+  // getHighEntropyValues/toJSON are native-registered too: plain arrows
+  // here would leak the whole client-hints payload via toString.
   const uad = {
     brands: [
       {brand: 'Google Chrome', version: '__UA_MAJOR__'},
@@ -75,31 +116,35 @@ STEALTH_INIT_TMPL = """
     ],
     mobile: false,
     platform: 'Linux',
-    getHighEntropyValues: () => Promise.resolve({
-      architecture: 'x86',
-      bitness: '64',
-      brands: uad.brands,
-      fullVersionList: [
-        {brand: 'Google Chrome', version: '__UA_FULL__'},
-        {brand: 'Chromium', version: '__UA_FULL__'},
-        {brand: 'Not)A;Brand', version: '24.0.0.0'},
-      ],
-      mobile: false,
-      model: '',
-      platform: 'Linux',
-      platformVersion: '',
-      uaFullVersion: '__UA_FULL__',
-      wow64: false,
-    }),
-    toJSON: () => ({brands: uad.brands, mobile: false, platform: 'Linux'}),
+    getHighEntropyValues: makeNative(function getHighEntropyValues(hints) {
+      return Promise.resolve({
+        architecture: 'x86',
+        bitness: '64',
+        brands: uad.brands,
+        fullVersionList: [
+          {brand: 'Google Chrome', version: '__UA_FULL__'},
+          {brand: 'Chromium', version: '__UA_FULL__'},
+          {brand: 'Not)A;Brand', version: '24.0.0.0'},
+        ],
+        mobile: false,
+        model: '',
+        platform: 'Linux',
+        platformVersion: '',
+        uaFullVersion: '__UA_FULL__',
+        wow64: false,
+      });
+    }, 'getHighEntropyValues'),
+    toJSON: makeNative(function toJSON() {
+      return {brands: uad.brands, mobile: false, platform: 'Linux'};
+    }, 'toJSON'),
   };
   try {
     Object.defineProperty(navigator, 'userAgentData',
-      {get: () => uad, configurable: true});
+      {get: makeNative(() => uad, 'get userAgentData'), configurable: true});
   } catch(e) {
     try {
       Object.defineProperty(Navigator.prototype, 'userAgentData',
-        {get: () => uad, configurable: true});
+        {get: makeNative(() => uad, 'get userAgentData'), configurable: true});
     } catch(e2) {}
   }
 })()
