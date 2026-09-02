@@ -13,7 +13,11 @@ import re
 # `navigator.permissions` inside the same payload instead of a second round
 # trip. With patchright + full Chromium the values should match a real
 # Chrome 149 on Linux x86_64.
-CHECKS = """
+# NOTE: raw string — the payload embeds JS regexes (\b, \d, \.). In a plain
+# Python string \b silently becomes a BACKSPACE character (a legal JS regex
+# token that matches a literal backspace instead of a word boundary), which
+# corrupted the WebRTC private-IP detection so it never matched.
+CHECKS = r"""
 async () => {
   const r = {};
   r.webdriver = navigator.webdriver;
@@ -280,6 +284,50 @@ async () => {
       setTimeout(finish, 2000);
     } catch (e) { resolve({status: 'err:' + e.name}); }
   });
+  // -- native toString consistency -----------------------------------------
+  // Anti-bot libraries call Function.prototype.toString on native-looking
+  // methods to expose spoofs: a patched WebGL getParameter whose source
+  // still contains the hardcoded vendor constants is an instant tell.
+  // browser.py registers every injected function with a toString shim;
+  // these probes verify the shim holds — and that the shim itself stays
+  // invisible (a toString whose own source leaks is worse than no shim).
+  r.fnToStringSelf = (() => {
+    try { return Function.prototype.toString.toString(); }
+    catch (e) { return 'err:' + e.name; }
+  })();
+  r.webglToString = (() => {
+    try {
+      if (typeof WebGLRenderingContext === 'undefined') return 'no-webgl1';
+      return WebGLRenderingContext.prototype.getParameter.toString();
+    } catch (e) { return 'err:' + e.name; }
+  })();
+  r.webgl2ToString = (() => {
+    try {
+      if (typeof WebGL2RenderingContext === 'undefined') return 'no-webgl2';
+      return WebGL2RenderingContext.prototype.getParameter.toString();
+    } catch (e) { return 'err:' + e.name; }
+  })();
+  r.deviceMemoryGetter = (() => {
+    try {
+      const d = Object.getOwnPropertyDescriptor(navigator, 'deviceMemory');
+      if (!d) return 'no-own-prop';
+      return d.get ? d.get.toString() : 'own-no-getter';
+    } catch (e) { return 'err:' + e.name; }
+  })();
+  r.uaDataGetter = (() => {
+    try {
+      const d = Object.getOwnPropertyDescriptor(navigator, 'userAgentData');
+      if (!d) return 'no-own-prop';
+      return d.get ? d.get.toString() : 'own-no-getter';
+    } catch (e) { return 'err:' + e.name; }
+  })();
+  r.uaDataHenv = (() => {
+    try {
+      const h = navigator.userAgentData
+        && navigator.userAgentData.getHighEntropyValues;
+      return h ? h.toString() : 'no-henv';
+    } catch (e) { return 'err:' + e.name; }
+  })();
   try {
     r.screenWidth = screen.width;
     r.screenHeight = screen.height;
@@ -317,6 +365,24 @@ EXPECTED = {
     "device_memory": 8,
     "locale": "zh-CN",
 }
+
+# Marker strings that must never appear in a native-looking toString()
+# result: the WebGL vendor-id constant, the spoofed renderer, arrow getters
+# and the toString shim itself (its source references the spoof registry).
+_TOAST_LEAK_MARKERS = ("37445", "AMD Radeon", "=>", "spoof")
+
+
+def _native_leak(s) -> bool:
+    """True when a toString() result leaks JS source instead of native code.
+
+    Native methods stringify to ``function <name>() { [native code] }``; a
+    spoof whose source survives the probe contains its own code — and often
+    the spoof constants themselves (see _TOAST_LEAK_MARKERS).
+    """
+    s = str(s)
+    if "[native code]" not in s:
+        return True
+    return any(m in s for m in _TOAST_LEAK_MARKERS)
 
 
 def _status(name, results, good, note, bad="FAIL", missing="WARN"):
@@ -522,6 +588,76 @@ def analyze_report(results: dict) -> dict:
             f"no raw local IPs leaked ({wrtc.get('mdns', 0)} mDNS, "
             f"{wrtc.get('publicIp', 0)} reflexive, {wrtc.get('other', 0)} other)",
             "no raw local IPs")
+
+    # -- native toString consistency (spoof-source leaks) -------------------
+    # Anti-bot libraries call Function.prototype.toString on native-looking
+    # methods to expose spoofs. browser.py registers every injected function
+    # with a toString shim; these checks verify the shim holds — and that
+    # the shim itself stays invisible (a leaking toString shim is worse
+    # than no shim at all).
+    fts = results.get("fnToStringSelf")
+    if fts is None or str(fts).startswith("err:"):
+        add("fnToStringSelf", "WARN",
+            f"Function.prototype.toString probe unavailable ({fts})",
+            "function toString() { [native code] }")
+    elif _native_leak(fts):
+        add("fnToStringSelf", "FAIL",
+            f"toString shim leaks its own source: {str(fts)[:60]}",
+            "function toString() { [native code] }")
+    else:
+        add("fnToStringSelf", "PASS", "Function.prototype.toString looks native",
+            "function toString() { [native code] }")
+    for key, label, missing in (
+            ("webglToString", "WebGL1", "no-webgl1"),
+            ("webgl2ToString", "WebGL2", "no-webgl2")):
+        s = results.get(key)
+        sv = str(s) if s is not None else ""
+        if s is None or sv in (missing,) or sv.startswith("err:"):
+            add(key, "WARN", f"{label} getParameter.toString unavailable ({s})",
+                "function getParameter() { [native code] }")
+        elif _native_leak(sv):
+            add(key, "FAIL",
+                f"{label} getParameter leaks spoof source via toString: "
+                f"{sv[:60]}",
+                "function getParameter() { [native code] }")
+        else:
+            add(key, "PASS", f"{label} getParameter survives toString probing",
+                "function getParameter() { [native code] }")
+    for key, label in (("deviceMemoryGetter", "deviceMemory"),
+                       ("uaDataGetter", "userAgentData")):
+        s = results.get(key)
+        sv = str(s) if s is not None else ""
+        if s is None or sv.startswith("err:"):
+            add(key, "WARN", f"{label} getter probe unavailable ({s})",
+                "native-looking getter")
+        elif sv == "no-own-prop":
+            add(key, "WARN",
+                f"{label} own-property spoof missing "
+                "(apply_stealth not run in this page?)",
+                "spoofed own-property getter")
+        elif sv == "own-no-getter":
+            add(key, "WARN", f"{label} spoofed as data property (no getter)",
+                "spoofed own-property getter")
+        elif _native_leak(sv):
+            add(key, "FAIL",
+                f"{label} getter leaks its source via toString: {sv[:60]}",
+                "native-looking getter")
+        else:
+            add(key, "PASS", f"{label} getter survives toString probing",
+                "native-looking getter")
+    henv = results.get("uaDataHenv")
+    hv = str(henv) if henv is not None else ""
+    if henv is None or hv in ("no-henv",) or hv.startswith("err:"):
+        add("uaDataHenv", "WARN",
+            f"getHighEntropyValues probe unavailable ({henv})",
+            "native-looking method")
+    elif _native_leak(hv):
+        add("uaDataHenv", "FAIL",
+            f"getHighEntropyValues leaks the UA-CH spoof source: {hv[:60]}",
+            "native-looking method")
+    else:
+        add("uaDataHenv", "PASS", "getHighEntropyValues survives toString probing",
+            "native-looking method")
 
     # -- client hints (UA-CH): modern anti-bot checks these for consistency --
     # Real Chrome advertises a "Google Chrome" brand in navigator.userAgentData;
