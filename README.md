@@ -39,6 +39,11 @@ of *removing* it entirely is what actually passes detection.
   Chrome UA: `Google Chrome` brand present and `uaFullVersion` synced to the
   UA version (headless builds omit the flagship brand and report a stale
   build number — both are bot tells)
+- 🛡️ **Native toString hardening** — every injected function (WebGL
+  `getParameter` patches, `deviceMemory`/`userAgentData` getters, UA-CH
+  methods) is registered with a `Function.prototype.toString` shim so
+  `fn.toString()` reports `[native code]` like a real browser; the
+  self-check verifies no spoof source leaks through toString probing
 - 🖱️ **Human-like interaction** — randomized delays, progressive scrolling
   with occasional backtracks, ease-in-out curved mouse paths, type character
   by character, multi-field form filling with human-style clears and
@@ -137,6 +142,7 @@ src/stealth_browser/
 | Plugin array includes Chrome's PDF viewers (name realism) | ✅ |
 | UA-CH (`userAgentData`) brands → Google Chrome + Chromium | ✅ |
 | UA-CH `uaFullVersion` → matches UA version | ✅ |
+| Spoofed natives survive `Function.prototype.toString` (source-leak check) | ✅ |
 | PhantomJS / Selenium artifacts | ✅ all pass |
 | iframe / sandbox injection | ✅ all pass |
 
