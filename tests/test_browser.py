@@ -53,15 +53,43 @@ class _FakeMouse:
 
 
 class _FakeKeyboard:
+    """Records the key stream AND simulates a real text field: characters
+    append at the cursor, select-all marks the whole content, Backspace
+    deletes the selection (or the last character). Typo self-correction is
+    probabilistic (keystroke dynamics), so tests assert on ``content`` /
+    ``field_contents`` rather than the raw stream."""
+
     def __init__(self):
         self.typed = []
         self.presses = []
+        # Unified (kind, value) stream in real order (type/press events).
+        self.events = []
+        self.content = ""      # simulated field content
+        self.selected = False  # select-all state
+        self.fields = []       # content snapshots when the page switches fields
 
     async def type(self, ch):
         self.typed.append(ch)
+        self.events.append(("type", ch))
+        self.content += ch
+        self.selected = False
 
     async def press(self, key):
         self.presses.append(key)
+        self.events.append(("press", key))
+        if key == "ControlOrMeta+a":
+            self.selected = True
+        elif key == "Backspace":
+            if self.selected:
+                self.content = ""  # select-all + Backspace wipes the field
+                self.selected = False
+            elif self.content:
+                self.content = self.content[:-1]
+
+    @property
+    def field_contents(self) -> list:
+        """Final content of each field the fake page focused, in order."""
+        return self.fields + [self.content]
 
 
 class _FakePage:
@@ -97,8 +125,9 @@ async def test_human_type_chars():
     page = _FakePage()
     await human_type(page, "input#q", "hi")
     assert getattr(page, "clicked", None) == "input#q"
-    # each character is typed individually, in order
-    assert page.keyboard.typed == ["h", "i"]
+    # each character lands in the field, in order (a self-corrected typo
+    # would put wrong keys in the raw stream — check the field content)
+    assert page.keyboard.content == "hi"
 
 
 # --------------------------------------------------------------------------
@@ -108,8 +137,8 @@ async def test_human_fill_form_types_fields_in_order():
     page = _FakePageWithLocator()
     await human_fill_form(page, [("input#name", "Neo"),
                                  ("input#email", "x@y.z")])
-    # all characters typed, in field order, into the shared keyboard stream
-    assert "".join(page.keyboard.typed) == "Neox@y.z"
+    # all characters end up in their fields, in order (simulated content)
+    assert page.keyboard.field_contents == ["Neo", "x@y.z"]
     # ended focused on the last field (click-to-focus path ran for each)
     assert page.located == "input#email"
     assert page.mouse.downs == 2 and page.mouse.ups == 2  # one click per field
@@ -120,16 +149,23 @@ async def test_human_fill_form_clears_before_typing():
     then Backspace — before the new text is typed, never an instant fill."""
     page = _FakePageWithLocator()
     await human_fill_form(page, [("input#name", "Neo")])
-    assert page.keyboard.presses == ["ControlOrMeta+a", "Backspace"]
+    # select-all is always the first press; everything else is Backspace
+    # (the field wipe, plus possible typo self-corrections)
+    assert page.keyboard.presses[0] == "ControlOrMeta+a"
+    assert set(page.keyboard.presses) <= {"ControlOrMeta+a", "Backspace"}
     # clearing happened BEFORE the new text went in
-    assert "".join(page.keyboard.typed) == "Neo"
+    select_all = page.keyboard.events.index(("press", "ControlOrMeta+a"))
+    first_type = next(i for i, (k, _) in enumerate(page.keyboard.events)
+                      if k == "type")
+    assert select_all < first_type
+    assert page.keyboard.content == "Neo"
 
 
 async def test_human_fill_form_clear_false_skips_wipe():
     page = _FakePageWithLocator()
     await human_fill_form(page, [("input#name", "Neo")], clear=False)
-    assert page.keyboard.presses == []
-    assert "".join(page.keyboard.typed) == "Neo"
+    assert "ControlOrMeta+a" not in page.keyboard.presses
+    assert page.keyboard.content == "Neo"
 
 
 async def test_human_fill_form_empty_text_leaves_field_untouched():
@@ -138,8 +174,10 @@ async def test_human_fill_form_empty_text_leaves_field_untouched():
     page = _FakePageWithLocator()
     await human_fill_form(page, [("input#name", "Neo"), ("input#note", "")])
     assert page.located == "input#note"
-    assert page.keyboard.presses == ["ControlOrMeta+a", "Backspace"]  # name only
-    assert "".join(page.keyboard.typed) == "Neo"
+    # only the name field was cleared (plus possible typo corrections)
+    assert page.keyboard.presses[0] == "ControlOrMeta+a"
+    assert "ControlOrMeta+a" not in page.keyboard.presses[1:]
+    assert page.keyboard.field_contents == ["Neo", ""]
 
 
 # --------------------------------------------------------------------------
@@ -203,6 +241,14 @@ class _FakePageWithLocator:
 
     def locator(self, selector):
         self.located = selector
+        # Switching to another field: snapshot the previous field's content
+        # and start from a fresh empty input (a real form has one field per
+        # input, each with its own content).
+        kb = self.keyboard
+        if kb.content or kb.events:
+            kb.fields.append(kb.content)
+        kb.content = ""
+        kb.selected = False
         return _FakeLocator(self._box)
 
 
@@ -214,7 +260,7 @@ async def test_human_type_uses_human_click_path():
     assert page.located == "input#q"
     assert page.mouse.moves, "expected a curved cursor approach before typing"
     assert page.mouse.downs == 1 and page.mouse.ups == 1
-    assert page.keyboard.typed == ["o", "k"]
+    assert page.keyboard.content == "ok"
 
 
 async def test_human_click_lands_inside_bbox():
@@ -241,6 +287,68 @@ async def test_human_move_continues_from_last_position():
     # start of the second path must be near (300, 300) — the remembered end
     # of the first path (jitter budget ±6, scaled down on the first step)
     assert abs(x0 - 300) <= 8 and abs(y0 - 300) <= 8
+
+
+# --------------------------------------------------------------------------
+# Keystroke dynamics: bursts, boundary pauses, self-corrected typos
+# --------------------------------------------------------------------------
+def test_default_mistake_rate_is_small_but_nonzero():
+    from stealth_browser.browser import DEFAULT_MISTAKE_RATE
+
+    assert 0.0 < DEFAULT_MISTAKE_RATE < 0.2
+
+
+async def test_human_type_mistakes_false_never_slips():
+    """mistakes=False: the exact key stream, zero corrections."""
+    page = _FakePage()
+    text = "abcdefghijklmnopqrstuvwxyz"
+    await human_type(page, "input#q", text, mistakes=False)
+    assert page.keyboard.typed == list(text)
+    assert "Backspace" not in page.keyboard.presses
+
+
+async def test_human_type_mistakes_always_slips_adjacent():
+    """mistakes=1.0: every eligible letter first lands on an adjacent key
+    (case preserved) and is corrected with Backspace — the field still ends
+    up with exactly the intended text."""
+    from stealth_browser.browser import _ADJACENT_KEYS
+
+    page = _FakePage()
+    text = "aBcde"
+    await human_type(page, "input#q", text, mistakes=1.0)
+    assert page.keyboard.content == text
+    ev = page.keyboard.events
+    assert len(ev) == 3 * len(text)  # (type wrong, Backspace, type right) x n
+    for j, ch in enumerate(text):
+        wrong_ev, bs_ev, right_ev = ev[3 * j], ev[3 * j + 1], ev[3 * j + 2]
+        assert wrong_ev[0] == "type" and wrong_ev[1] != ch
+        assert bs_ev == ("press", "Backspace")
+        assert right_ev == ("type", ch)
+        wrong = wrong_ev[1]
+        assert wrong.lower() in _ADJACENT_KEYS[ch.lower()]
+        assert wrong.isupper() == ch.isupper()
+
+
+async def test_human_type_never_slips_on_non_letters():
+    """Digits, punctuation and spaces are never mistyped — a wrong digit
+    could trip client-side validation before the correction lands."""
+    page = _FakePage()
+    await human_type(page, "input#q", "123 45.6", mistakes=1.0)
+    assert page.keyboard.typed == list("123 45.6")
+    assert "Backspace" not in page.keyboard.presses
+
+
+async def test_human_type_rejects_invalid_mistake_rate():
+    page = _FakePage()
+    with pytest.raises(ValueError):
+        await human_type(page, "input#q", "hi", mistakes=1.5)
+
+
+async def test_human_fill_form_threads_mistakes_knob():
+    page = _FakePageWithLocator()
+    await human_fill_form(page, [("input#name", "abcdef")], mistakes=False)
+    assert page.keyboard.typed == list("abcdef")
+    assert page.keyboard.presses == ["ControlOrMeta+a", "Backspace"]
 
 
 # --------------------------------------------------------------------------
