@@ -48,6 +48,11 @@ of *removing* it entirely is what actually passes detection.
   with occasional backtracks, ease-in-out curved mouse paths, type character
   by character, multi-field form filling with human-style clears and
   inter-field pacing
+- ⌨️ **Keystroke dynamics** — inter-key cadence with quick bursts,
+  word/sentence-boundary pauses, and occasional adjacent-key typos
+  immediately self-corrected with Backspace (`mistakes` knob, default ~3%
+  of letters); keystroke-dynamics analysis flags flawless input that never
+  needs a correction
 - 💾 **Persistent profiles** — cookies/localStorage survive restarts, so you
   log in once and stay logged in
 - 🔍 **Fingerprint self-check** — local JS checks (webdriver incl. inside
@@ -104,6 +109,8 @@ async def main():
     await page.goto("https://example.com")
     await apply_stealth(page)  # re-apply spoof in main world (see below)
     await human_scroll(page)
+    # keystroke dynamics: bursts, boundary pauses, occasional
+    # self-corrected typos (disable with mistakes=False, tune with a float)
     await human_type(page, "input[name=q]", "hello world")
     # Fill a multi-field form like a person: curved-click focus, select-all
     # + Backspace clears, per-key delays, randomized inter-field pauses
