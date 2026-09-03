@@ -284,29 +284,107 @@ async def human_click(page, selector: str | None = None, *,
     await page.mouse.up()
 
 
-async def human_type(page, selector: str, text: str) -> None:
-    """Type character-by-character with random inter-key delays.
+# QWERTY adjacency for realistic typo simulation: a slip lands on a key
+# next to the intended one, never a random letter. Only ASCII letters typo —
+# a wrong digit/symbol can trip client-side validation before the correction
+# lands, and non-Latin text has no keyboard geometry to slip on.
+_ADJACENT_KEYS = {
+    "q": "wa", "w": "qeas", "e": "wrsd", "r": "etdf", "t": "ryfg",
+    "y": "tugh", "u": "yihj", "i": "uojk", "o": "ipkl", "p": "ol",
+    "a": "qwsz", "s": "aedx", "d": "erfcx", "f": "rtgvc", "g": "tyhbv",
+    "h": "yujnb", "j": "uikmn", "k": "iolm", "l": "opk",
+    "z": "asx", "x": "zsdc", "c": "xdfv", "v": "cfgb", "b": "vghn",
+    "n": "bhm", "m": "njk",
+}
+
+# Per-character probability that an eligible letter is mistyped and then
+# self-corrected. Keystroke-dynamics analysis (behavioural biometrics) flags
+# text that was typed perfectly and never needed a correction — real people
+# slip roughly every few hundred keys.
+DEFAULT_MISTAKE_RATE = 0.03
+
+
+def _mistake_rate(mistakes) -> float:
+    """Normalise the ``mistakes`` knob.
+
+    True -> DEFAULT_MISTAKE_RATE, False -> 0, or an explicit float
+    probability in [0, 1] (anything else raises ValueError).
+    """
+    if mistakes is True:
+        return DEFAULT_MISTAKE_RATE
+    if mistakes is False:
+        return 0.0
+    try:
+        rate = float(mistakes)
+    except (TypeError, ValueError):
+        raise ValueError("mistakes must be True, False, or a number in [0, 1]")
+    if not 0.0 <= rate <= 1.0:
+        raise ValueError("mistakes must be True, False, or a number in [0, 1]")
+    return rate
+
+
+async def human_type(page, selector: str, text: str, *,
+                     mistakes: bool | float = True) -> None:
+    """Type character-by-character with human keystroke dynamics.
 
     Focuses the field with a human-like click (curved cursor approach, not a
-    teleport) before typing.
+    teleport) before typing. See _human_type_text for the cadence model and
+    the ``mistakes`` knob (occasional adjacent-key typos, self-corrected).
     """
     await human_click(page, selector)
-    await _human_type_text(page, text)
+    await _human_type_text(page, text, mistakes=mistakes)
 
 
-async def _human_type_text(page, text: str) -> None:
-    """Type text character-by-character with random inter-key delays.
+async def _human_type_text(page, text: str, *,
+                           mistakes: bool | float = True) -> None:
+    """Type text character-by-character with human keystroke dynamics.
 
     Shared typing engine for human_type and human_fill_form; assumes the
     target field already has focus (human_click took care of it).
+
+    Beyond random inter-key delays the cadence models how people actually
+    type: familiar runs come out in quick bursts, a space occasionally gets
+    a short "next word" pause and sentence punctuation a longer breath.
+    With ``mistakes`` enabled (the default) a small share of letters lands
+    on a QWERTY-adjacent key and is immediately corrected with Backspace —
+    keystroke-dynamics analysis flags flawless input that never needs a
+    correction, so perfect typing is itself a bot tell.
+
+    ``mistakes``: True (default rate), False (never), or a float in [0, 1]
+    as the per-character slip probability.
     """
-    for ch in text:
+    rate = _mistake_rate(mistakes)
+    burst_left = 0
+    for i, ch in enumerate(text):
+        if (rate and ch.isascii() and ch.isalpha()
+                and ch.lower() in _ADJACENT_KEYS
+                and random.random() < rate):
+            wrong = random.choice(_ADJACENT_KEYS[ch.lower()])
+            await page.keyboard.type(wrong.upper() if ch.isupper() else wrong)
+            await asyncio.sleep(random.uniform(0.15, 0.4))  # noticing the slip
+            await page.keyboard.press("Backspace")
+            await asyncio.sleep(random.uniform(0.05, 0.15))
         await page.keyboard.type(ch)
-        await asyncio.sleep(random.uniform(0.03, 0.12))
+        if i == len(text) - 1:
+            break  # nobody pauses after the last keystroke
+        if burst_left > 0:
+            burst_left -= 1
+            await asyncio.sleep(random.uniform(0.015, 0.045))  # quick run
+            continue
+        if ch in " \t" and random.random() < 0.2:
+            await asyncio.sleep(random.uniform(0.15, 0.45))  # next word...
+        elif ch in ".!?,;:":
+            await asyncio.sleep(random.uniform(0.08, 0.3))   # sentence breath
+        elif random.random() < 0.15 and text[i + 1] not in " \t\n":
+            burst_left = random.randint(1, 3)  # a familiar word flows out
+            await asyncio.sleep(random.uniform(0.015, 0.045))
+        else:
+            await asyncio.sleep(random.uniform(0.03, 0.12))
 
 
 async def human_fill_form(page, fields, *, clear: bool = True,
-                          field_pause=(0.5, 1.8)) -> None:
+                          field_pause=(0.5, 1.8),
+                          mistakes: bool | float = True) -> None:
     """Fill a sequence of form fields the way a person works through a form.
 
     Real form automation is a *sequence* of fields, and scripts that focus
@@ -319,7 +397,9 @@ async def human_fill_form(page, fields, *, clear: bool = True,
     2. when ``clear`` and there is text to type, wipe existing content the
        way a keyboard user does (select-all + Backspace, not an instant
        ``fill("\u200b")``),
-    3. type the text character-by-character with random inter-key delays,
+    3. type the text character-by-character with human keystroke dynamics
+       (quick bursts, word/sentence-boundary pauses, occasional
+       self-corrected typos — see _human_type_text),
     4. pause between fields like someone reading the next label — usually
        ``field_pause`` seconds, occasionally (~15%) a longer 0.8–2.2s
        "thinking" pause on top.
@@ -328,6 +408,10 @@ async def human_fill_form(page, fields, *, clear: bool = True,
     typing) — useful to move the cursor through the form without modifying
     those inputs. Intended for text inputs and textareas; not for <select>
     or checkbox/radio controls (use human_click for those).
+
+    ``mistakes`` controls the typo engine (True -> default rate, False ->
+    never, float in [0, 1] -> per-character slip probability); slips only
+    affect ASCII letters and are always corrected before the fill moves on.
     """
     fields = list(fields)
     for i, (selector, text) in enumerate(fields):
@@ -337,7 +421,7 @@ async def human_fill_form(page, fields, *, clear: bool = True,
             await asyncio.sleep(random.uniform(0.05, 0.15))
             await page.keyboard.press("Backspace")
             await asyncio.sleep(random.uniform(0.1, 0.3))
-        await _human_type_text(page, text)
+        await _human_type_text(page, text, mistakes=mistakes)
         if i < len(fields) - 1:
             pause = random.uniform(*field_pause)
             if random.random() < 0.15:  # occasionally re-reads the next label
