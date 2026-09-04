@@ -86,6 +86,12 @@ def _clean_results():
         "deviceMemoryGetter": "function get deviceMemory() { [native code] }",
         "uaDataGetter": "function get userAgentData() { [native code] }",
         "uaDataHenv": "function getHighEntropyValues() { [native code] }",
+        # permission-surface cross-check + media/mime realism
+        "notificationPermission": "default",
+        "mimeTypes": 2,
+        "mimeTypeNames": ["application/pdf", "text/pdf"],
+        "mediaDevices": {"count": 2, "audioinput": 1, "audiooutput": 1,
+                          "videoinput": 0},
     }
 
 
@@ -203,6 +209,10 @@ def test_new_checks_missing_keys_warn_not_crash():
     assert a["checks"]["webrtcLeak"]["status"] == "WARN"
     # webdriver-family checks treat None as clean absence (same as iframe)
     assert a["checks"]["workerWebdriver"]["status"] == "PASS"
+    # permission-surface cross-check + media/mime realism
+    assert a["checks"]["notificationPermission"]["status"] == "WARN"
+    assert a["checks"]["mimeTypes"]["status"] == "WARN"
+    assert a["checks"]["mediaDevices"]["status"] == "WARN"
 
 
 # --------------------------------------------------------------------------
@@ -506,6 +516,155 @@ def test_webrtc_error_status_warns():
 
 
 # --------------------------------------------------------------------------
+# analyze_report — permission-surface cross-check (Notification vs query)
+# --------------------------------------------------------------------------
+def test_notification_permission_consistent_passes():
+    r = _clean_results()
+    r["permissions"] = "prompt"
+    r["notificationPermission"] = "default"
+    a = analyze_report(r)
+    assert a["checks"]["notificationPermission"]["status"] == "PASS"
+    assert a["summary"]["verdict"] == "clean"
+
+
+def test_notification_permission_both_granted_passes():
+    r = _clean_results()
+    r["permissions"] = "granted"
+    r["notificationPermission"] = "granted"
+    a = analyze_report(r)
+    assert a["checks"]["notificationPermission"]["status"] == "PASS"
+
+
+def test_notification_permission_both_denied_passes():
+    r = _clean_results()
+    r["permissions"] = "denied"
+    r["notificationPermission"] = "denied"
+    a = analyze_report(r)
+    assert a["checks"]["notificationPermission"]["status"] == "PASS"
+
+
+def test_notification_permission_denied_mismatch_is_flagged():
+    # The sannysoft "Permissions" tell: one surface patched, the other not.
+    r = _clean_results()
+    r["permissions"] = "prompt"
+    r["notificationPermission"] = "denied"
+    a = analyze_report(r)
+    assert a["checks"]["notificationPermission"]["status"] == "FAIL"
+    assert a["summary"]["verdict"] == "flagged"
+
+
+def test_notification_permission_granted_mismatch_is_flagged():
+    r = _clean_results()
+    r["permissions"] = "prompt"
+    r["notificationPermission"] = "granted"
+    a = analyze_report(r)
+    assert a["checks"]["notificationPermission"]["status"] == "FAIL"
+
+
+def test_notification_permission_missing_warns():
+    r = _clean_results()
+    del r["notificationPermission"]
+    a = analyze_report(r)
+    assert a["checks"]["notificationPermission"]["status"] == "WARN"
+
+
+def test_notification_permission_without_query_warns():
+    r = _clean_results()
+    r["permissions"] = "err:TypeError"
+    a = analyze_report(r)
+    assert a["checks"]["notificationPermission"]["status"] == "WARN"
+
+
+def test_notification_permission_no_api_warns():
+    r = _clean_results()
+    r["notificationPermission"] = "no-notification-api"
+    a = analyze_report(r)
+    assert a["checks"]["notificationPermission"]["status"] == "WARN"
+
+
+# --------------------------------------------------------------------------
+# analyze_report — MIME-type realism (length-only plugin spoofs)
+# --------------------------------------------------------------------------
+def test_mime_types_with_pdf_pass():
+    r = _clean_results()
+    a = analyze_report(r)
+    assert a["checks"]["mimeTypes"]["status"] == "PASS"
+
+
+def test_length_only_plugin_spoof_warns():
+    # Fabricated plugin array of the right length but no matching MIME types.
+    r = _clean_results()
+    r["mimeTypes"] = 0
+    r["mimeTypeNames"] = []
+    a = analyze_report(r)
+    assert a["checks"]["mimeTypes"]["status"] == "WARN"
+    assert a["summary"]["verdict"] == "attention"
+
+
+def test_mime_types_without_pdf_warn():
+    r = _clean_results()
+    r["mimeTypeNames"] = ["application/x-fake"]
+    a = analyze_report(r)
+    assert a["checks"]["mimeTypes"]["status"] == "WARN"
+
+
+def test_mime_types_missing_warns():
+    r = _clean_results()
+    del r["mimeTypes"]
+    del r["mimeTypeNames"]
+    a = analyze_report(r)
+    assert a["checks"]["mimeTypes"]["status"] == "WARN"
+
+
+def test_mime_types_probe_error_warns():
+    r = _clean_results()
+    r["mimeTypes"] = "err:TypeError"
+    r["mimeTypeNames"] = "err:TypeError"
+    a = analyze_report(r)
+    assert a["checks"]["mimeTypes"]["status"] == "WARN"
+
+
+# --------------------------------------------------------------------------
+# analyze_report — media device enumeration
+# --------------------------------------------------------------------------
+def test_media_devices_present_passes():
+    r = _clean_results()
+    a = analyze_report(r)
+    assert a["checks"]["mediaDevices"]["status"] == "PASS"
+
+
+def test_media_devices_empty_warns():
+    # Headless shells report an empty enumerateDevices list.
+    r = _clean_results()
+    r["mediaDevices"] = {"count": 0, "audioinput": 0, "audiooutput": 0,
+                          "videoinput": 0}
+    a = analyze_report(r)
+    assert a["checks"]["mediaDevices"]["status"] == "WARN"
+    assert a["summary"]["verdict"] == "attention"
+
+
+def test_media_devices_missing_warns():
+    r = _clean_results()
+    del r["mediaDevices"]
+    a = analyze_report(r)
+    assert a["checks"]["mediaDevices"]["status"] == "WARN"
+
+
+def test_media_devices_probe_error_warns():
+    r = _clean_results()
+    r["mediaDevices"] = "err:NotAllowedError"
+    a = analyze_report(r)
+    assert a["checks"]["mediaDevices"]["status"] == "WARN"
+
+
+def test_media_devices_no_api_warns():
+    r = _clean_results()
+    r["mediaDevices"] = "no-media-devices"
+    a = analyze_report(r)
+    assert a["checks"]["mediaDevices"]["status"] == "WARN"
+
+
+# --------------------------------------------------------------------------
 # analyze_report — native toString consistency (spoof-source leaks)
 # --------------------------------------------------------------------------
 def test_webgl_tostring_leak_is_flagged():
@@ -720,7 +879,12 @@ def test_checks_js_executes_without_reference_errors():
       plugins: {length: 5}, hardwareConcurrency: 8, deviceMemory: 8,
       maxTouchPoints: 0, userAgent: 'Chrome/149', platform: 'Linux x86_64',
       permissions: {query: async () => ({state: 'prompt'})},
+      mimeTypes: {length: 2,
+                  0: {type: 'application/pdf'}, 1: {type: 'text/pdf'}},
+      mediaDevices: {enumerateDevices: async () =>
+        [{kind: 'audioinput'}, {kind: 'audiooutput'}]},
     };
+    const Notification = {permission: 'default'};
     const window = {chrome: {runtime: {id: 'x'}}, innerWidth: 1366,
                     outerWidth: 1366, devicePixelRatio: 1};
     const document = {
@@ -746,10 +910,23 @@ def test_checks_js_executes_without_reference_errors():
           || !('webrtcLeak' in r)
           || !('fnToStringSelf' in r) || !('webglToString' in r)
           || !('webgl2ToString' in r) || !('deviceMemoryGetter' in r)
-          || !('uaDataGetter' in r) || !('uaDataHenv' in r)) {
+          || !('uaDataGetter' in r) || !('uaDataHenv' in r)
+          || !('notificationPermission' in r) || !('mimeTypes' in r)
+          || !('mimeTypeNames' in r) || !('mediaDevices' in r)) {
         throw new Error('missing keys: ' + Object.keys(r));
       }
       if (r.permissions !== 'prompt') throw new Error('permissions: ' + r.permissions);
+      if (r.notificationPermission !== 'default') {
+        throw new Error('notificationPermission: ' + r.notificationPermission);
+      }
+      if (r.mimeTypes !== 2) throw new Error('mimeTypes: ' + r.mimeTypes);
+      if (!Array.isArray(r.mimeTypeNames) || r.mimeTypeNames[0] !== 'application/pdf') {
+        throw new Error('mimeTypeNames: ' + JSON.stringify(r.mimeTypeNames));
+      }
+      if (!r.mediaDevices || r.mediaDevices.count !== 2
+          || r.mediaDevices.audioinput !== 1 || r.mediaDevices.audiooutput !== 1) {
+        throw new Error('mediaDevices: ' + JSON.stringify(r.mediaDevices));
+      }
       console.log('OK');
     }).catch(e => { console.error(e.message); process.exit(1); });
     """
