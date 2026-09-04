@@ -56,9 +56,12 @@ of *removing* it entirely is what actually passes detection.
 - 💾 **Persistent profiles** — cookies/localStorage survive restarts, so you
   log in once and stay logged in
 - 🔍 **Fingerprint self-check** — local JS checks (webdriver incl. inside
-  iframes, UA-CH consistency, WebGL2-vs-WebGL1 renderer consistency,
-  plugin-name realism, standard font availability, locale/languages
-  cross-check, screen plausibility) + optional sannysoft remote scan
+  iframes and Web Workers, UA-CH consistency, WebGL2-vs-WebGL1 renderer
+  consistency, plugin-name and MIME-type realism, permission-surface
+  cross-check (Notification.permission vs permissions.query),
+  media-device enumeration, WebRTC ICE leak probe, audio fingerprint,
+  standard font availability, locale/languages cross-check, screen
+  plausibility) + optional sannysoft remote scan
 - 🌐 **Configurable** — locale, timezone, viewport, custom UA all exposed
 
 ## Install
@@ -149,6 +152,9 @@ src/stealth_browser/
 | Plugin array includes Chrome's PDF viewers (name realism) | ✅ |
 | UA-CH (`userAgentData`) brands → Google Chrome + Chromium | ✅ |
 | UA-CH `uaFullVersion` → matches UA version | ✅ |
+| `Notification.permission` ↔ `permissions.query` cross-check | ✅ consistent |
+| `navigator.mimeTypes` include the PDF handlers (catches length-only plugin spoofs) | ✅ |
+| Media devices enumerated via `enumerateDevices` (headless shells report none) | ✅ audiooutput present |
 | Spoofed natives survive `Function.prototype.toString` (source-leak check) | ✅ |
 | PhantomJS / Selenium artifacts | ✅ all pass |
 | iframe / sandbox injection | ✅ all pass |
