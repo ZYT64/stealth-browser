@@ -45,6 +45,17 @@ async () => {
   try {
     r.permissions = (await navigator.permissions.query({name: 'notifications'})).state;
   } catch (e) { r.permissions = 'err:' + e.name; }
+  // Notification.permission is the second surface of the same notification
+  // permission: real Chrome always agrees (default ~ prompt, granted ~
+  // granted, denied ~ denied). A spoof that patches only one surface — the
+  // exact tell sannysoft's "Permissions" row catches — leaves the two
+  // disagreeing.
+  r.notificationPermission = (() => {
+    try {
+      return typeof Notification !== 'undefined' ? Notification.permission
+                                                 : 'no-notification-api';
+    } catch (e) { return 'err:' + e.name; }
+  })();
   r.webglVendor = (() => {
     try {
       const c = document.createElement('canvas').getContext('webgl');
@@ -135,6 +146,16 @@ async () => {
   // (a length-only spoof) is a known anti-spoof tell.
   r.pluginNames = (() => {
     try { return Array.from(navigator.plugins, (p) => p.name); }
+    catch (e) { return 'err:' + e.name; }
+  })();
+  // MIME-type realism: Chrome's PDF plugins ship matching MIME types
+  // (application/pdf, text/pdf). A length-only plugin spoof fabricates the
+  // names but leaves navigator.mimeTypes empty — a known anti-spoof tell.
+  r.mimeTypes = (() => {
+    try { return navigator.mimeTypes.length; } catch (e) { return 'err:' + e.name; }
+  })();
+  r.mimeTypeNames = (() => {
+    try { return Array.from(navigator.mimeTypes, (m) => m.type); }
     catch (e) { return 'err:' + e.name; }
   })();
   // Standard font availability: minimal bot containers ship no fonts, real
@@ -242,6 +263,23 @@ async () => {
       resolve();
     }
   });
+  // Media device enumeration: fingerprintjs probes enumerateDevices — real
+  // desktop Chrome always exposes at least one audio output, while headless
+  // shells report an empty list. Bucket counts only (never device IDs) so
+  // the JSON report stays safe to share.
+  r.mediaDevices = await (async () => {
+    try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+        return 'no-media-devices';
+      }
+      const devs = await navigator.mediaDevices.enumerateDevices();
+      const out = {count: devs.length, audioinput: 0, audiooutput: 0, videoinput: 0};
+      for (const d of devs) {
+        if (out[d.kind] !== undefined) out[d.kind]++;
+      }
+      return out;
+    } catch (e) { return 'err:' + e.name; }
+  })();
   // WebRTC leak probe: a data-channel peer connection gathers ICE candidates
   // even with no remote peer. Chrome's privacy default hides local IPs
   // behind mDNS (.local) hostnames; raw RFC1918 IPs in host candidates mean
@@ -588,6 +626,24 @@ def analyze_report(results: dict) -> dict:
             f"no raw local IPs leaked ({wrtc.get('mdns', 0)} mDNS, "
             f"{wrtc.get('publicIp', 0)} reflexive, {wrtc.get('other', 0)} other)",
             "no raw local IPs")
+    # Media device enumeration: real desktop Chrome always exposes at least
+    # one audio output device; headless shells report an empty list
+    # (fingerprintjs probes this surface). Counts only — never device IDs.
+    md = results.get("mediaDevices")
+    if md is None:
+        add("mediaDevices", "WARN", "media device probe unavailable (missing)",
+            ">= 1 device")
+    elif not isinstance(md, dict):
+        add("mediaDevices", "WARN", f"media device probe failed ({md})",
+            ">= 1 device")
+    elif md.get("count"):
+        kinds = ", ".join(f"{k}={v}" for k, v in sorted(md.items())
+                          if k != "count" and v)
+        add("mediaDevices", "PASS", f"{md['count']} media device(s) ({kinds})",
+            ">= 1 device")
+    else:
+        add("mediaDevices", "WARN", "no media devices — headless shells report none",
+            ">= 1 device")
 
     # -- native toString consistency (spoof-source leaks) -------------------
     # Anti-bot libraries call Function.prototype.toString on native-looking
@@ -724,6 +780,37 @@ def analyze_report(results: dict) -> dict:
     else:
         add("pluginNames", "WARN", f"cannot read plugin names ({names})",
             "Chrome PDF plugins present")
+    # MIME-type realism: Chrome's PDF plugins ship matching MIME types
+    # (application/pdf, text/pdf). A length-only plugin spoof fabricates the
+    # names but leaves navigator.mimeTypes empty — a known anti-spoof tell.
+    mt = results.get("mimeTypes")
+    mtn = results.get("mimeTypeNames")
+    if mt is None and mtn is None:
+        add("mimeTypes", "WARN", "mimeTypes unavailable (missing)",
+            "PDF mime types present")
+    elif isinstance(mtn, list) and mtn:
+        joined = ", ".join(str(t) for t in mtn)
+        if any("pdf" in str(t).lower() for t in mtn):
+            add("mimeTypes", "PASS",
+                f"mime types include the PDF handlers ({joined[:70]})",
+                "PDF mime types present")
+        else:
+            add("mimeTypes", "WARN",
+                f"{len(mtn)} mime types, none is a PDF handler — fabricated plugin list",
+                "PDF mime types present")
+    elif (mt == 0 or mtn == []) and results.get("plugins", 0):
+        add("mimeTypes", "WARN",
+            "plugins present but navigator.mimeTypes is empty — length-only plugin spoof",
+            "PDF mime types present")
+    elif mt == 0 or mtn == []:
+        add("mimeTypes", "WARN", "no mime types at all (headless-shell profile)",
+            "PDF mime types present")
+    elif str(mt).startswith("err:") and (mtn is None or str(mtn).startswith("err:")):
+        add("mimeTypes", "WARN", f"mimeTypes probe failed ({mt})",
+            "PDF mime types present")
+    else:
+        add("mimeTypes", "PASS", f"navigator.mimeTypes reports {mt} entries",
+            "PDF mime types present")
     fonts = results.get("fonts")
     if isinstance(fonts, dict) and fonts:
         avail = sum(1 for v in fonts.values() if v)
@@ -742,6 +829,33 @@ def analyze_report(results: dict) -> dict:
     add("permissions", "WARN" if str(results.get("permissions", "")).startswith("err")
         else ("PASS" if results.get("permissions") in ("prompt", "granted") else "WARN"),
         "query state should be prompt/granted", "prompt|granted")
+    # Permission-surface cross-check: navigator.permissions.query and
+    # Notification.permission expose the same underlying notification
+    # permission. Real Chrome always agrees (default ~ prompt, granted ~
+    # granted, denied ~ denied); a spoof that patches only one surface — the
+    # exact tell sannysoft's "Permissions" row catches — leaves them
+    # disagreeing. One surface missing/erroneous means we cannot cross-check
+    # (WARN); readable surfaces that disagree are a hard FAIL.
+    notif = results.get("notificationPermission")
+    perm = str(results.get("permissions", ""))
+    neutral = ("default", "prompt")
+    if notif is None or str(notif) in ("no-notification-api",) or str(notif).startswith("err:"):
+        add("notificationPermission", "WARN",
+            f"Notification.permission unavailable ({notif})",
+            "consistent with permissions.query")
+    elif perm.startswith("err:") or not perm:
+        add("notificationPermission", "WARN",
+            f"cannot cross-check (permissions.query unavailable: {perm or 'missing'})",
+            "consistent with permissions.query")
+    elif str(notif) == perm or (str(notif) in neutral and perm in neutral):
+        add("notificationPermission", "PASS",
+            f"Notification.permission ({notif}) agrees with permissions.query ({perm})",
+            "consistent with permissions.query")
+    else:
+        add("notificationPermission", "FAIL",
+            f"permission surfaces disagree: Notification.permission={notif} "
+            f"but permissions.query={perm} — partial-spoof tell",
+            "consistent with permissions.query")
     add("deviceMemory", "PASS" if results.get("deviceMemory") == EXPECTED["device_memory"]
         else "WARN", f"should be {EXPECTED['device_memory']} (spoofed)",
         str(EXPECTED["device_memory"]))
