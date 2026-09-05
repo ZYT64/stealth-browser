@@ -61,7 +61,11 @@ of *removing* it entirely is what actually passes detection.
   cross-check (Notification.permission vs permissions.query),
   media-device enumeration, WebRTC ICE leak probe, audio fingerprint,
   standard font availability, locale/languages cross-check, screen
-  plausibility) + optional sannysoft remote scan
+  plausibility) plus a **wire-level header probe** (CDP) that cross-checks
+  the HTTP `Accept-Language` header against `navigator.languages` — a
+  header/JS locale mismatch is invisible to page scripts and catches
+  JS-only locale spoofs and header-rewriting proxies + optional sannysoft
+  remote scan
 - 🌐 **Configurable** — locale, timezone, viewport, custom UA all exposed
 
 ## Install
@@ -134,7 +138,7 @@ asyncio.run(main())
 ```
 src/stealth_browser/
   browser.py            # anti-detect browser factory + human-like ops
-  fingerprint_check.py  # local JS checks + sannysoft scan
+  fingerprint_check.py  # local JS checks + wire header probe + sannysoft scan
 ```
 
 ## Anti-fingerprint check results (sannysoft, arm64 Raspberry Pi)
@@ -153,6 +157,7 @@ src/stealth_browser/
 | UA-CH (`userAgentData`) brands → Google Chrome + Chromium | ✅ |
 | UA-CH `uaFullVersion` → matches UA version | ✅ |
 | `Notification.permission` ↔ `permissions.query` cross-check | ✅ consistent |
+| HTTP `Accept-Language` ↔ `navigator.languages` cross-check (wire vs JS, CDP) | ✅ consistent |
 | `navigator.mimeTypes` include the PDF handlers (catches length-only plugin spoofs) | ✅ |
 | Media devices enumerated via `enumerateDevices` (headless shells report none) | ✅ audiooutput present |
 | Spoofed natives survive `Function.prototype.toString` (source-leak check) | ✅ |
