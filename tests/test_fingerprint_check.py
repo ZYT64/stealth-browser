@@ -3,6 +3,7 @@
 `analyze_report` is pure Python, so these run without a browser. The JS
 syntax check shells out to node when available (skipped otherwise).
 """
+import asyncio
 import shutil
 import subprocess
 import tempfile
@@ -10,7 +11,8 @@ import os
 
 import pytest
 
-from stealth_browser.fingerprint_check import CHECKS, analyze_report
+from stealth_browser import fingerprint_check
+from stealth_browser.fingerprint_check import CHECKS, analyze_report, header_probe
 
 
 # --------------------------------------------------------------------------
@@ -92,6 +94,8 @@ def _clean_results():
         "mimeTypeNames": ["application/pdf", "text/pdf"],
         "mediaDevices": {"count": 2, "audioinput": 1, "audiooutput": 1,
                           "videoinput": 0},
+        # wire-level HTTP header (CDP probe) must agree with navigator.languages
+        "httpAcceptLanguage": "zh-CN,zh;q=0.9",
     }
 
 
@@ -213,6 +217,8 @@ def test_new_checks_missing_keys_warn_not_crash():
     assert a["checks"]["notificationPermission"]["status"] == "WARN"
     assert a["checks"]["mimeTypes"]["status"] == "WARN"
     assert a["checks"]["mediaDevices"]["status"] == "WARN"
+    # wire header probe missing -> cannot verify, not a leak
+    assert a["checks"]["httpAcceptLanguage"]["status"] == "WARN"
 
 
 # --------------------------------------------------------------------------
@@ -369,6 +375,11 @@ def test_fonts_unprobeable_warns():
 def test_languages_locale_mismatch_warns():
     r = _clean_results()
     r["languages"] = ["en-US", "en"]
+    # Keep the wire header consistent with the (mis-set) JS locale: this
+    # test isolates the languages-vs-EXPECTED check. A zh-CN header next to
+    # en-US languages would be a header/JS mismatch — its own FAIL (see the
+    # wire Accept-Language tests below).
+    r["httpAcceptLanguage"] = "en-US,en;q=0.9"
     a = analyze_report(r)
     assert a["checks"]["languages"]["status"] == "WARN"
     assert a["summary"]["verdict"] == "attention"
@@ -662,6 +673,165 @@ def test_media_devices_no_api_warns():
     r["mediaDevices"] = "no-media-devices"
     a = analyze_report(r)
     assert a["checks"]["mediaDevices"]["status"] == "WARN"
+
+
+# --------------------------------------------------------------------------
+# analyze_report — wire Accept-Language vs navigator.languages (header/JS)
+# --------------------------------------------------------------------------
+def test_wire_accept_language_match_passes():
+    a = analyze_report(_clean_results())
+    assert a["checks"]["httpAcceptLanguage"]["status"] == "PASS"
+    assert a["summary"]["verdict"] == "clean"
+
+
+def test_wire_accept_language_case_insensitive_match():
+    """Language tags are case-insensitive (BCP47) — 'zh-cn' == 'zh-CN'."""
+    r = _clean_results()
+    r["httpAcceptLanguage"] = "zh-cn,zh;q=0.9"
+    a = analyze_report(r)
+    assert a["checks"]["httpAcceptLanguage"]["status"] == "PASS"
+
+
+def test_wire_accept_language_mismatch_is_flagged():
+    """JS-only locale spoof: navigator.languages patched, wire header left
+    at the context's real locale — the classic header/JS mismatch."""
+    r = _clean_results()
+    r["httpAcceptLanguage"] = "en-US,en;q=0.9"
+    a = analyze_report(r)
+    assert a["checks"]["httpAcceptLanguage"]["status"] == "FAIL"
+    assert a["summary"]["verdict"] == "flagged"
+
+
+def test_wire_accept_language_wildcard_is_flagged():
+    """Real Chrome never sends '*' — a rewritten/anonymous header disagrees
+    with navigator.languages just like a spoof would."""
+    r = _clean_results()
+    r["httpAcceptLanguage"] = "*"
+    a = analyze_report(r)
+    assert a["checks"]["httpAcceptLanguage"]["status"] == "FAIL"
+
+
+def test_wire_accept_language_missing_warns():
+    r = _clean_results()
+    del r["httpAcceptLanguage"]
+    a = analyze_report(r)
+    assert a["checks"]["httpAcceptLanguage"]["status"] == "WARN"
+
+
+def test_wire_accept_language_capture_error_warns():
+    r = _clean_results()
+    r["httpAcceptLanguage"] = "err:TargetClosedError"
+    a = analyze_report(r)
+    assert a["checks"]["httpAcceptLanguage"]["status"] == "WARN"
+
+
+def test_wire_accept_language_without_languages_warns():
+    """Header captured but navigator.languages missing — no cross-check."""
+    r = _clean_results()
+    r["languages"] = None
+    a = analyze_report(r)
+    assert a["checks"]["httpAcceptLanguage"]["status"] == "WARN"
+
+
+# --------------------------------------------------------------------------
+# header_probe — CDP wire capture (fake CDP session, no browser needed)
+# --------------------------------------------------------------------------
+class _FakeCDP:
+    """Minimal CDP session: records handlers, replays canned request events
+    once Network.enable is called — mirrors the real event flow closely
+    enough to test the capture logic without a browser."""
+
+    def __init__(self, events):
+        self._events = events
+        self.handlers = {}
+        self.detached = False
+
+    def on(self, event, fn):
+        self.handlers.setdefault(event, []).append(fn)
+
+    async def send(self, method, params=None):
+        if method == "Network.enable":
+            for evt in self._events:
+                for fn in self.handlers.get("Network.requestWillBeSent", []):
+                    fn(evt)
+
+    async def detach(self):
+        self.detached = True
+
+
+class _FakeContext:
+    def __init__(self, cdp):
+        self._cdp = cdp
+
+    async def new_cdp_session(self, page):
+        return self._cdp
+
+
+class _FakePage:
+    """Duck-typed stand-in: evaluate is fire-and-forget (the fake CDP already
+    delivered its events during Network.enable)."""
+
+    def __init__(self, cdp):
+        self.context = _FakeContext(cdp)
+
+    async def evaluate(self, script):
+        return None
+
+
+def _req_event(headers):
+    return {"request": {"url": "https://example.com/favicon.ico",
+                        "method": "GET", "headers": headers}}
+
+
+async def test_header_probe_captures_accept_language():
+    cdp = _FakeCDP([_req_event({"Accept-Language": "zh-CN,zh;q=0.9",
+                                 "User-Agent": "Chrome/149"})])
+    out = await header_probe(_FakePage(cdp))
+    assert out == {"httpAcceptLanguage": "zh-CN,zh;q=0.9"}
+    assert cdp.detached  # session always cleaned up
+
+
+async def test_header_probe_header_casing_insensitive():
+    """CDP header casing varies across versions — lowercase must match too."""
+    cdp = _FakeCDP([_req_event({"accept-language": "zh-CN,zh;q=0.9"})])
+    out = await header_probe(_FakePage(cdp))
+    assert out == {"httpAcceptLanguage": "zh-CN,zh;q=0.9"}
+
+
+async def test_header_probe_uses_first_matching_request():
+    """Later requests must not overwrite the first captured header."""
+    cdp = _FakeCDP([
+        _req_event({"accept-language": "zh-CN,zh;q=0.9"}),
+        _req_event({"accept-language": "en-US,en;q=0.9"}),
+    ])
+    out = await header_probe(_FakePage(cdp))
+    assert out == {"httpAcceptLanguage": "zh-CN,zh;q=0.9"}
+
+
+async def test_header_probe_no_matching_request_returns_none(monkeypatch):
+    """No request carrying Accept-Language (about:blank fallback, blocked
+    fetch, headerless engine) -> None, i.e. 'cannot verify' — not a leak."""
+    monkeypatch.setattr(fingerprint_check, "_HEADER_PROBE_TIMEOUT", 0.05)
+    cdp = _FakeCDP([_req_event({"User-Agent": "Chrome/149"})])
+    out = await header_probe(_FakePage(cdp))
+    assert out == {"httpAcceptLanguage": None}
+
+
+async def test_header_probe_no_events_at_all_returns_none(monkeypatch):
+    monkeypatch.setattr(fingerprint_check, "_HEADER_PROBE_TIMEOUT", 0.05)
+    out = await header_probe(_FakePage(_FakeCDP([])))
+    assert out == {"httpAcceptLanguage": None}
+
+
+async def test_header_probe_session_error_reports_err():
+    """A page/context without CDP support degrades to err:<name>, never
+    raises — cmd_check must keep working for the remaining checks."""
+
+    class _NoCDPPage:
+        pass  # no .context — new_cdp_session unavailable
+
+    out = await header_probe(_NoCDPPage())
+    assert out["httpAcceptLanguage"].startswith("err:")
 
 
 # --------------------------------------------------------------------------
