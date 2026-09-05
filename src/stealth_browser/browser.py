@@ -477,7 +477,7 @@ async def save_state(ctx, profile_dir: Path) -> None:
 # Sub-commands
 # --------------------------------------------------------------------------
 async def cmd_check(args) -> None:
-    from .fingerprint_check import CHECKS, analyze_report
+    from .fingerprint_check import CHECKS, analyze_report, header_probe
 
     p, browser, ctx, _ = await open_browser(args.profile)
     page = await ctx.new_page()
@@ -491,6 +491,11 @@ async def cmd_check(args) -> None:
         await page.goto("about:blank")
     await apply_stealth(page)
     res = await page.evaluate(CHECKS)
+    # Wire-level header capture (CDP): the HTTP Accept-Language header is
+    # invisible to page JS, so it cannot come from the CHECKS payload — the
+    # probe reads it off a live request for the header/JS locale cross-check
+    # (httpAcceptLanguage in analyze_report).
+    res.update(await header_probe(page))
     analysis = analyze_report(res)
 
     # Compact status table
