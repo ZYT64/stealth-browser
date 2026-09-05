@@ -1,4 +1,4 @@
-"""Anti-fingerprint verification: local JS checks + optional sannysoft scan.
+"""Anti-fingerprint verification: local JS checks + wire header probe + sannysoft scan.
 
 The local checks exercise common bot-detection signals. With patchright +
 the full Chromium build these should all behave like a real browser
@@ -7,6 +7,7 @@ the raw captured values into a PASS/WARN/FAIL classification that the CLI
 renders as a summary and persists as a JSON report.
 """
 
+import asyncio
 import re
 
 # JS checks executed in the page. This is an *async* IIFE so we can query
@@ -884,6 +885,42 @@ def analyze_report(results: dict) -> dict:
     else:
         add("languages", "WARN", f"navigator.languages unavailable ({langs})",
             f"{EXPECTED['locale']} first")
+    # Wire-vs-JS locale consistency: Chrome generates the HTTP
+    # Accept-Language header from the same accept-language setting that
+    # backs navigator.languages, so the two can never disagree. A JS-only
+    # languages spoof (or a context launched without `locale`) leaves the
+    # wire header untouched — a header/JS mismatch that proxy-aware
+    # anti-bot systems probe for, and that no in-page JS check can see
+    # (the header is not readable from page scripts; header_probe captures
+    # it via CDP instead). None = no request captured (offline/about:blank
+    # fallback) — treat as "cannot verify", not as a leak.
+    al = results.get("httpAcceptLanguage")
+    js_first = (str(langs[0]).strip().lower()
+                if isinstance(langs, (list, tuple)) and langs else None)
+    if al is None:
+        add("httpAcceptLanguage", "WARN",
+            "no request captured — wire header not verifiable",
+            "first tag matches navigator.languages[0]")
+    elif str(al).startswith("err:"):
+        add("httpAcceptLanguage", "WARN", f"header capture failed ({al})",
+            "first tag matches navigator.languages[0]")
+    elif js_first is None:
+        add("httpAcceptLanguage", "WARN",
+            "navigator.languages unavailable — cannot cross-check",
+            "first tag matches navigator.languages[0]")
+    else:
+        wire_first = str(al).split(",")[0].split(";")[0].strip().lower()
+        if wire_first == js_first:
+            add("httpAcceptLanguage", "PASS",
+                f"wire Accept-Language ({wire_first}) agrees with "
+                f"navigator.languages[0] ({js_first})",
+                "first tag matches navigator.languages[0]")
+        else:
+            add("httpAcceptLanguage", "FAIL",
+                f"wire Accept-Language first tag '{wire_first}' disagrees "
+                f"with navigator.languages[0] '{js_first}' — JS-only locale "
+                "spoof or header-rewriting proxy",
+                "first tag matches navigator.languages[0]")
     add("platform", "INFO", f"{results.get('platform')}", "Linux x86_64")
     add("maxTouchPoints", "INFO", "desktop should be 0",
         "0")
@@ -926,6 +963,81 @@ def analyze_report(results: dict) -> dict:
         verdict = "clean"
     s["verdict"] = verdict
     return {"checks": checks, "summary": s}
+
+
+# Seconds to wait for a matching request when capturing wire headers.
+# Module-level so tests can shrink it (unit tests run without a browser).
+_HEADER_PROBE_TIMEOUT = 5.0
+
+# Fire-and-forget same-origin fetch used to make the browser put a real
+# request on the wire (the CDP listener below reads its headers). The arrow
+# returns undefined so evaluate() never blocks on the response; the try/
+# catch covers pages where relative URLs cannot resolve (about:blank).
+_FETCH_PROBE_JS = (
+    "() => { try { fetch('/favicon.ico?stealth_probe=1', "
+    "{cache: 'no-store'}).catch(() => {}); } catch (e) {} }"
+)
+
+
+async def header_probe(page) -> dict:
+    """Capture the wire-level Accept-Language header Chrome actually sends.
+
+    Anti-bot systems cross-check the HTTP ``Accept-Language`` header against
+    ``navigator.languages``: real Chrome generates the header from the same
+    accept-language setting that backs ``navigator.languages``, so the two
+    can never disagree. A JS-only spoof of ``navigator.languages`` (or a
+    context launched without ``locale``) leaves the wire header untouched —
+    a mismatch that proxy-aware detectors probe for, and one no in-page JS
+    check can see (request headers are not readable from page scripts).
+
+    The probe opens a CDP Network session on the current page, fires a
+    same-origin ``fetch`` (no navigation, so main-world spoof patches stay
+    intact) and reads the header straight off the request event — no local
+    echo server needed (an ``http://`` fetch from an ``https://`` page would
+    be blocked as mixed content anyway). Returns::
+
+        {"httpAcceptLanguage": "zh-CN,zh;q=0.9" | None | "err:TypeName"}
+
+    ``None`` means no request was captured (e.g. the offline about:blank
+    fallback or a page that blocks fetches) — the analyzer treats that as
+    "cannot verify", not as a leak.
+    """
+    try:
+        cdp = await page.context.new_cdp_session(page)
+    except Exception as e:
+        return {"httpAcceptLanguage": f"err:{type(e).__name__}"}
+
+    got = asyncio.Event()
+    headers: dict = {}
+
+    def on_request(evt: dict) -> None:
+        if "httpAcceptLanguage" in headers:
+            return  # first matching request wins
+        # Header casing varies across CDP versions — match case-insensitively.
+        req_headers = evt.get("request", {}).get("headers", {})
+        for k, v in req_headers.items():
+            if k.lower() == "accept-language" and v:
+                headers["httpAcceptLanguage"] = v
+                got.set()
+                return
+
+    cdp.on("Network.requestWillBeSent", on_request)
+    try:
+        await cdp.send("Network.enable")
+        try:
+            await page.evaluate(_FETCH_PROBE_JS)
+        except Exception:
+            pass  # page busy/closing — the wait below decides the outcome
+        try:
+            await asyncio.wait_for(got.wait(), timeout=_HEADER_PROBE_TIMEOUT)
+        except asyncio.TimeoutError:
+            pass
+    finally:
+        try:
+            await cdp.detach()
+        except Exception:
+            pass
+    return {"httpAcceptLanguage": headers.get("httpAcceptLanguage")}
 
 
 async def sannysoft_scan(page) -> None:
