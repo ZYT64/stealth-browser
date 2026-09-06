@@ -24,6 +24,11 @@ async () => {
   r.webdriver = navigator.webdriver;
   r.languages = navigator.languages;
   r.plugins = navigator.plugins.length;
+  // pdfViewerEnabled (Chrome 106+): reflects the bundled PDF viewer. Real
+  // desktop Chrome reports true; headless shells and stripped builds report
+  // false — fingerprintjs reads this surface directly.
+  r.pdfViewerEnabled = (navigator.pdfViewerEnabled === undefined)
+    ? null : !!navigator.pdfViewerEnabled;
   r.chrome = !!window.chrome;
   r.chromeRuntime = !!(window.chrome && window.chrome.runtime && window.chrome.runtime.id !== undefined);
   r.userAgent = navigator.userAgent;
@@ -43,6 +48,26 @@ async () => {
   r.viewportDelta = window.outerWidth - window.innerWidth;
   r.timezoneOffset = new Date().getTimezoneOffset();
   r.timezoneName = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  // Timezone surface consistency: real Chrome derives getTimezoneOffset(),
+  // the GMT offset inside Date.prototype.toString and the Intl timeZoneName
+  // offset from the same ICU timezone database, so the three surfaces can
+  // never disagree within one realm. A partial spoof (an Intl override that
+  // misses Date, or vice versa) leaves them disagreeing — the same class of
+  // tell as the WebGL1/2 and permission-surface cross-checks. Both raw
+  // abbreviations are captured here; analyze_report cross-checks the three.
+  r.tzDateOffsetName = (() => {
+    try { return (new Date().toString().match(/GMT[+-]\d{2}:?\d{2}/) || [null])[0]; }
+    catch (e) { return 'err:' + e.name; }
+  })();
+  r.tzIntlOffsetName = (() => {
+    try {
+      const dtf = new Intl.DateTimeFormat('en-US', {timeZoneName: 'short'});
+      if (typeof dtf.formatToParts !== 'function') return null;
+      const p = dtf.formatToParts(new Date())
+        .find((x) => x.type === 'timeZoneName');
+      return p ? p.value : null;
+    } catch (e) { return 'err:' + e.name; }
+  })();
   try {
     r.permissions = (await navigator.permissions.query({name: 'notifications'})).state;
   } catch (e) { r.permissions = 'err:' + e.name; }
@@ -424,6 +449,24 @@ def _native_leak(s) -> bool:
     return any(m in s for m in _TOAST_LEAK_MARKERS)
 
 
+def _gmt_minutes(v):
+    """Parse a GMT offset abbreviation into minutes west of UTC.
+
+    Accepts the shapes the two JS surfaces produce — ``GMT+8`` (Intl
+    timeZoneName 'short') and ``GMT+0800`` / ``GMT+05:30`` (inside
+    ``Date.prototype.toString``) — and returns the value in the
+    ``getTimezoneOffset`` convention (UTC+8 -> -480). Returns None when
+    *v* is not a parseable GMT offset (missing surface, error string,
+    arbitrary text).
+    """
+    m = re.fullmatch(r"GMT([+-])(\d{1,2})(?::?(\d{2}))?", str(v).strip())
+    if not m:
+        return None
+    total = int(m.group(2)) * 60 + int(m.group(3) or 0)
+    east = total if m.group(1) == "+" else -total
+    return -east
+
+
 def _status(name, results, good, note, bad="FAIL", missing="WARN"):
     """Classify one check: good -> PASS, anything else -> FAIL/WARN."""
     if name not in results or results[name] is None:
@@ -760,6 +803,18 @@ def analyze_report(results: dict) -> dict:
     # -- warnings: inconsistencies real browsers don't have -----------------
     add("plugins", "FAIL" if results.get("plugins", 0) == 0 else "PASS",
         "headless shell reports 0 plugins", ">= 1")
+    # pdfViewerEnabled (Chrome 106+): real desktop Chrome bundles the PDF
+    # viewer and reports true; headless shells report false. fingerprintjs
+    # reads this surface directly. A missing property is 'cannot verify',
+    # not a leak (older engines and the offline fallback payloads).
+    pve = results.get("pdfViewerEnabled")
+    if pve is None:
+        add("pdfViewerEnabled", "WARN", "pdfViewerEnabled unavailable (missing)", "true")
+    elif pve is True:
+        add("pdfViewerEnabled", "PASS", "built-in PDF viewer reported (true)", "true")
+    else:
+        add("pdfViewerEnabled", "WARN",
+            f"pdfViewerEnabled={pve} — headless shells report false", "true")
     # Plugin-name realism: real desktop Chrome always lists its PDF viewers
     # (Chrome 149 reports 5 entries, all "…PDF Viewer" variants). A spoofed
     # array of the right length with fabricated names is a known anti-spoof
@@ -870,6 +925,41 @@ def analyze_report(results: dict) -> dict:
     add("timezone", "PASS" if tz_ok else "WARN",
         f"must be {EXPECTED['timezone_name']} (UTC+8, offset {EXPECTED['timezone_offset_min']})",
         f"{EXPECTED['timezone_name']} / {EXPECTED['timezone_offset_min']}")
+    # Timezone surface consistency: getTimezoneOffset(), the GMT offset in
+    # Date.prototype.toString and the Intl timeZoneName offset all come from
+    # the same ICU timezone in real Chrome — the three can never disagree.
+    # A partial spoof (Intl patched but Date not, or vice versa) leaves the
+    # surfaces disagreeing; the wire header probe catches the same class of
+    # leak for locale. Unreadable surfaces count as 'cannot verify', never
+    # as a leak: a FAIL requires two surfaces that both parse and disagree.
+    raw_off = results.get("timezoneOffset")
+    if isinstance(raw_off, float) and raw_off.is_integer():
+        raw_off = int(raw_off)
+    parsed = {
+        "getTimezoneOffset": raw_off if isinstance(raw_off, int) else None,
+        "Date.toString": _gmt_minutes(results.get("tzDateOffsetName")),
+        "Intl.offsetName": _gmt_minutes(results.get("tzIntlOffsetName")),
+    }
+    surfaces = {k: parsed[k] for k in ("getTimezoneOffset", "Date.toString",
+                                       "Intl.offsetName")}
+    readable = {k: v for k, v in surfaces.items() if v is not None}
+    desc = ", ".join(f"{k}={surfaces[k]}" for k in surfaces)
+    if len(readable) >= 2 and len(set(readable.values())) == 1:
+        add("timezoneConsistency", "PASS",
+            f"all readable timezone surfaces agree ({desc})",
+            "all surfaces agree")
+    elif len(readable) >= 2:
+        add("timezoneConsistency", "FAIL",
+            f"timezone surfaces disagree ({desc}) — partial timezone spoof",
+            "all surfaces agree")
+    elif len(readable) == 1:
+        add("timezoneConsistency", "WARN",
+            f"only one timezone surface readable ({desc}) — cannot cross-check",
+            "all surfaces agree")
+    else:
+        add("timezoneConsistency", "WARN",
+            f"no timezone surface readable ({desc})",
+            "all surfaces agree")
 
     # -- informational: no single right answer, useful for spotting drift ---
     # locale/languages consistency: anti-bot systems cross-check the HTTP
