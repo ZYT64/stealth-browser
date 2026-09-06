@@ -61,7 +61,10 @@ of *removing* it entirely is what actually passes detection.
   cross-check (Notification.permission vs permissions.query),
   media-device enumeration, WebRTC ICE leak probe, audio fingerprint,
   standard font availability, locale/languages cross-check, screen
-  plausibility) plus a **wire-level header probe** (CDP) that cross-checks
+  plausibility, timezone-surface consistency (getTimezoneOffset vs
+  Date.toString vs Intl offset name — partial timezone spoofs leave the
+  surfaces disagreeing), navigator.pdfViewerEnabled) plus a **wire-level
+  header probe** (CDP) that cross-checks
   the HTTP `Accept-Language` header against `navigator.languages` — a
   header/JS locale mismatch is invisible to page scripts and catches
   JS-only locale spoofs and header-rewriting proxies + optional sannysoft
