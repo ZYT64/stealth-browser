@@ -46,6 +46,10 @@ def _clean_results():
         "viewportDelta": 0,
         "timezoneOffset": -480,
         "timezoneName": "Asia/Shanghai",
+        # timezone surface consistency: all three surfaces must agree
+        # (getTimezoneOffset convention: UTC+8 -> -480 -> GMT+0800/GMT+8)
+        "tzDateOffsetName": "GMT+0800",
+        "tzIntlOffsetName": "GMT+8",
         "permissions": "prompt",
         "webglVendor": "Google Inc. (AMD)",
         "webgl": "ANGLE (AMD, AMD Radeon Graphics (RADV VEGA10) Direct3D11 "
@@ -90,6 +94,8 @@ def _clean_results():
         "uaDataHenv": "function getHighEntropyValues() { [native code] }",
         # permission-surface cross-check + media/mime realism
         "notificationPermission": "default",
+        # real desktop Chrome bundles the PDF viewer (Chrome 106+)
+        "pdfViewerEnabled": True,
         "mimeTypes": 2,
         "mimeTypeNames": ["application/pdf", "text/pdf"],
         "mediaDevices": {"count": 2, "audioinput": 1, "audiooutput": 1,
@@ -245,6 +251,121 @@ def test_timezone_mismatch_warns():
     r["timezoneOffset"] = 240
     a = analyze_report(r)
     assert a["checks"]["timezone"]["status"] == "WARN"
+
+
+# --------------------------------------------------------------------------
+# analyze_report — timezone surface consistency + pdfViewerEnabled
+# --------------------------------------------------------------------------
+def test_timezone_consistency_agreement_passes():
+    a = analyze_report(_clean_results())
+    c = a["checks"]["timezoneConsistency"]
+    assert c["status"] == "PASS"
+    assert "all readable timezone surfaces agree" in c["note"]
+
+
+def test_timezone_date_tostring_mismatch_is_flagged():
+    """A spoof that rewrites Intl but not Date leaves the abbreviations
+    disagreeing — the same class of partial-spoof leak as the WebGL1/2
+    cross-check."""
+    r = _clean_results()
+    r["tzDateOffsetName"] = "GMT+0000"
+    a = analyze_report(r)
+    assert a["checks"]["timezoneConsistency"]["status"] == "FAIL"
+    assert a["summary"]["verdict"] == "flagged"
+
+
+def test_timezone_intl_mismatch_is_flagged():
+    r = _clean_results()
+    r["tzIntlOffsetName"] = "GMT+9"
+    a = analyze_report(r)
+    assert a["checks"]["timezoneConsistency"]["status"] == "FAIL"
+
+
+def test_timezone_consistency_offset_vs_date_only_can_flag():
+    """Even without the Intl surface, a bad Date.toString abbreviation must
+    disagree with getTimezoneOffset — two readable surfaces suffice."""
+    r = _clean_results()
+    del r["tzIntlOffsetName"]
+    r["tzDateOffsetName"] = "GMT-0800"
+    a = analyze_report(r)
+    assert a["checks"]["timezoneConsistency"]["status"] == "FAIL"
+
+
+def test_timezone_consistency_half_hour_offsets_parse():
+    """Half-hour zones: +05:30 must round-trip from both abbrev shapes."""
+    r = _clean_results()
+    r["timezoneName"] = "Asia/Kolkata"  # the profile check warns; fine here
+    r["timezoneOffset"] = -330
+    r["tzDateOffsetName"] = "GMT+0530"
+    r["tzIntlOffsetName"] = "GMT+5:30"
+    a = analyze_report(r)
+    assert a["checks"]["timezoneConsistency"]["status"] == "PASS"
+
+
+def test_timezone_consistency_west_of_utc_sign_convention():
+    """UTC-6: getTimezoneOffset=+360 (minutes west) vs GMT-0600 — the
+    convention flip is the bug this test pins down."""
+    r = _clean_results()
+    r["timezoneName"] = "America/Chicago"
+    r["timezoneOffset"] = 360
+    r["tzDateOffsetName"] = "GMT-0600"
+    r["tzIntlOffsetName"] = "GMT-6"
+    a = analyze_report(r)
+    assert a["checks"]["timezoneConsistency"]["status"] == "PASS"
+
+
+def test_timezone_consistency_unparseable_surface_warns():
+    """Error strings are 'cannot verify', never a leak: one broken surface
+    leaves two healthy surfaces to cross-check (PASS, not FAIL); down to a
+    single surviving surface the verdict degrades to WARN."""
+    r = _clean_results()
+    r["tzDateOffsetName"] = "err:RangeError"
+    a = analyze_report(r)
+    assert a["checks"]["timezoneConsistency"]["status"] == "PASS"
+    assert a["summary"]["verdict"] != "flagged"
+
+    r["tzIntlOffsetName"] = None
+    a = analyze_report(r)
+    assert a["checks"]["timezoneConsistency"]["status"] == "WARN"
+    assert a["summary"]["verdict"] != "flagged"
+
+
+def test_timezone_consistency_single_surface_warns():
+    r = _clean_results()
+    del r["tzDateOffsetName"]
+    del r["tzIntlOffsetName"]
+    a = analyze_report(r)
+    assert a["checks"]["timezoneConsistency"]["status"] == "WARN"
+
+
+def test_timezone_consistency_all_missing_warns_not_crashes():
+    r = _clean_results()
+    del r["tzDateOffsetName"]
+    del r["tzIntlOffsetName"]
+    r["timezoneOffset"] = None
+    a = analyze_report(r)
+    assert a["checks"]["timezoneConsistency"]["status"] == "WARN"
+
+
+def test_pdf_viewer_enabled_passes():
+    a = analyze_report(_clean_results())
+    assert a["checks"]["pdfViewerEnabled"]["status"] == "PASS"
+
+
+def test_pdf_viewer_disabled_warns():
+    """Headless shells report false — a warning, not a hard leak."""
+    r = _clean_results()
+    r["pdfViewerEnabled"] = False
+    a = analyze_report(r)
+    assert a["checks"]["pdfViewerEnabled"]["status"] == "WARN"
+    assert a["summary"]["verdict"] != "flagged"
+
+
+def test_pdf_viewer_missing_warns():
+    r = _clean_results()
+    del r["pdfViewerEnabled"]
+    a = analyze_report(r)
+    assert a["checks"]["pdfViewerEnabled"]["status"] == "WARN"
 
 
 def test_missing_keys_warn_not_crash():
@@ -1082,7 +1203,9 @@ def test_checks_js_executes_without_reference_errors():
           || !('webgl2ToString' in r) || !('deviceMemoryGetter' in r)
           || !('uaDataGetter' in r) || !('uaDataHenv' in r)
           || !('notificationPermission' in r) || !('mimeTypes' in r)
-          || !('mimeTypeNames' in r) || !('mediaDevices' in r)) {
+          || !('mimeTypeNames' in r) || !('mediaDevices' in r)
+          || !('tzDateOffsetName' in r) || !('tzIntlOffsetName' in r)
+          || !('pdfViewerEnabled' in r)) {
         throw new Error('missing keys: ' + Object.keys(r));
       }
       if (r.permissions !== 'prompt') throw new Error('permissions: ' + r.permissions);
