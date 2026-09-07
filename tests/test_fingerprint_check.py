@@ -43,7 +43,18 @@ def _clean_results():
         "deviceMemory": 8,
         "maxTouchPoints": 0,
         "devicePixelRatio": 1,
-        "viewportDelta": 0,
+        "viewportDelta": 16,
+        # window geometry: real windowed Chrome reserves browser chrome
+        # between the viewport and the outer window, and the window
+        # (position + outer size) must fit on the screen — open_browser
+        # pairs a 1280x600 viewport with a 1366x768 screen and an outer
+        # window of 1296x680 at screenX/Y (10,10)
+        "innerWidth": 1280,
+        "innerHeight": 600,
+        "outerWidth": 1296,
+        "outerHeight": 680,
+        "screenX": 10,
+        "screenY": 10,
         "timezoneOffset": -480,
         "timezoneName": "Asia/Shanghai",
         # timezone surface consistency: all three surfaces must agree
@@ -113,6 +124,7 @@ def test_clean_profile_is_clean():
     assert a["checks"]["webdriver"]["status"] == "PASS"
     assert a["checks"]["timezone"]["status"] == "PASS"
     assert a["checks"]["permissions"]["status"] == "PASS"
+    assert a["checks"]["windowGeometry"]["status"] == "PASS"
 
 
 # --------------------------------------------------------------------------
@@ -516,6 +528,13 @@ def test_languages_missing_warns():
 def test_small_screen_warns():
     r = _clean_results()
     r["screenWidth"], r["screenHeight"] = 800, 600
+    # keep the window geometry coherent with the smaller screen (the outer
+    # window must still fit) so this test isolates the screenSize WARN
+    # instead of tripping the windowGeometry cross-check
+    r["screenX"], r["screenY"] = 0, 0
+    r["innerWidth"], r["innerHeight"] = 768, 470
+    r["outerWidth"], r["outerHeight"] = 784, 550
+    r["viewportDelta"] = 16
     a = analyze_report(r)
     assert a["checks"]["screenSize"]["status"] == "WARN"
     assert a["summary"]["verdict"] == "attention"
@@ -532,6 +551,100 @@ def test_chrome_internals_are_info():
     a = analyze_report(_clean_results())
     assert a["checks"]["chromeCsi"]["status"] == "INFO"
     assert a["checks"]["chromeLoadTimes"]["status"] == "INFO"
+
+
+# --------------------------------------------------------------------------
+# analyze_report — window geometry (windowed vs headless window surface)
+# --------------------------------------------------------------------------
+def test_window_geometry_windowed_profile_passes():
+    a = analyze_report(_clean_results())
+    c = a["checks"]["windowGeometry"]
+    assert c["status"] == "PASS"
+    assert "1296x680" in c["note"]
+
+
+def test_window_geometry_equal_inner_outer_fails():
+    """Headless profile: no real OS window, outer == inner on both axes."""
+    r = _clean_results()
+    r["viewportDelta"] = 0
+    r["outerWidth"], r["outerHeight"] = r["innerWidth"], r["innerHeight"]
+    a = analyze_report(r)
+    c = a["checks"]["windowGeometry"]
+    assert c["status"] == "FAIL"
+    assert "headless geometry" in c["note"]
+    assert a["summary"]["verdict"] == "flagged"
+
+
+def test_window_geometry_outer_smaller_than_inner_fails():
+    """Impossible geometry: the viewport can never exceed the outer window."""
+    r = _clean_results()
+    r["outerWidth"], r["outerHeight"] = 1200, 580
+    a = analyze_report(r)
+    c = a["checks"]["windowGeometry"]
+    assert c["status"] == "FAIL"
+    assert "smaller than inner" in c["note"]
+
+
+def test_window_geometry_width_delta_only_is_consistent():
+    """Linux maximized windows report outerWidth == innerWidth but real
+    chrome height — a partial equality is coherent, never a FAIL."""
+    r = _clean_results()
+    r["outerWidth"] = r["innerWidth"]
+    r["viewportDelta"] = 0
+    a = analyze_report(r)
+    assert a["checks"]["windowGeometry"]["status"] == "PASS"
+
+
+def test_window_geometry_outer_exceeds_screen_fails():
+    """The outer window can never be larger than the screen it renders on."""
+    r = _clean_results()
+    r["outerWidth"], r["outerHeight"] = 1920, 680
+    a = analyze_report(r)
+    c = a["checks"]["windowGeometry"]
+    assert c["status"] == "FAIL"
+    assert "exceeds screen" in c["note"]
+
+
+def test_window_geometry_position_overflow_fails():
+    """Position + outer size must stay inside the screen (window at 10,10
+    with outer 1296x680 fits a 1366x768 screen; nudging it right overflows)."""
+    r = _clean_results()
+    r["screenX"], r["screenY"] = 80, 120
+    a = analyze_report(r)
+    c = a["checks"]["windowGeometry"]
+    assert c["status"] == "FAIL"
+    assert "overflows screen" in c["note"]
+
+
+def test_window_geometry_position_at_origin_fits():
+    r = _clean_results()
+    r["screenX"], r["screenY"] = 0, 0
+    a = analyze_report(r)
+    assert a["checks"]["windowGeometry"]["status"] == "PASS"
+
+
+def test_window_geometry_missing_keys_warn_not_crash():
+    r = _clean_results()
+    for k in ("innerWidth", "innerHeight", "outerWidth", "outerHeight"):
+        del r[k]
+    a = analyze_report(r)
+    c = a["checks"]["windowGeometry"]
+    assert c["status"] == "WARN"
+    assert a["summary"]["failed"] == 0
+
+
+def test_window_geometry_position_missing_still_checks_invariants():
+    """screenX/Y unreadable: inner/outer invariants are still enforced (the
+    fit-on-screen cross-check is simply skipped)."""
+    r = _clean_results()
+    del r["screenX"], r["screenY"]
+    a = analyze_report(r)
+    assert a["checks"]["windowGeometry"]["status"] == "PASS"
+    r2 = _clean_results()
+    r2["outerHeight"] = 800  # exceeds the 768 screen with no position needed
+    del r2["screenX"], r2["screenY"]
+    a2 = analyze_report(r2)
+    assert a2["checks"]["windowGeometry"]["status"] == "FAIL"
 
 
 # --------------------------------------------------------------------------
