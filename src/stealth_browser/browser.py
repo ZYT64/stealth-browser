@@ -102,6 +102,24 @@ STEALTH_INIT_TMPL = """
   };
   try { spoof(WebGLRenderingContext.prototype); } catch(e) {}
   try { spoof(WebGL2RenderingContext.prototype); } catch(e) {}
+  // Window geometry: headless reports outer == inner — there is no real OS
+  // window, so no tab strip / URL bar live between the viewport and the
+  // outer frame. Anti-bot systems derive geometry lies from outer-inner
+  // deltas (creepjs probes this surface). Real windowed Chrome reserves
+  // browser chrome between the two: ~16px of window borders and ~80px of
+  // tab strip + URL bar. Define native-looking outer getters (clamped to
+  // the screen so the window always fits on any viewport) — open_browser
+  // pairs this with a 1280x600 viewport and a 1366x768 screen so every
+  // surface stays self-consistent: outer (1296x680) at screenX/Y (10,10)
+  // fits inside the 1366x768 screen with room to spare.
+  try {
+    Object.defineProperty(window, 'outerWidth',
+      {get: makeNative(() => Math.min(innerWidth + 16, screen.width),
+                       'get outerWidth'), configurable: true});
+    Object.defineProperty(window, 'outerHeight',
+      {get: makeNative(() => Math.min(innerHeight + 80, screen.height),
+                       'get outerHeight'), configurable: true});
+  } catch (e) {}
   // UA-CH (client hints): define unconditionally — about:blank does not
   // expose userAgentData at all, and on real pages it lives either on the
   // navigator instance or its prototype. Defining on the instance shadows
@@ -457,11 +475,19 @@ async def open_browser(profile_name: str = "default", headless: bool = True):
     profile_dir = PROFILE_DIR / profile_name
     profile_dir.mkdir(parents=True, exist_ok=True)
     storage = profile_dir / "state.json"
+    # Windowed-geometry profile: the viewport is the inner window (1280x600)
+    # and `screen` is the physical display (1366x768). The geometry spoof in
+    # STEALTH_INIT derives outer = inner + browser chrome (1296x680), so the
+    # whole surface reads as a real windowed browser: outer > inner and
+    # outer + screenX/Y (10,10) fits inside the screen. Viewport == screen
+    # (the headless default) would leave no room for window chrome and trip
+    # the window-geometry cross-check in fingerprint_check.
     ctx = await browser.new_context(
         user_agent=REAL_UA,
         locale="zh-CN",
         timezone_id="Asia/Shanghai",
-        viewport={"width": 1366, "height": 768},
+        viewport={"width": 1280, "height": 600},
+        screen={"width": 1366, "height": 768},
         storage_state=str(storage) if storage.exists() else None,
     )
     await ctx.add_init_script(STEALTH_INIT)
