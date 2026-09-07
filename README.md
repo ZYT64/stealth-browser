@@ -34,7 +34,10 @@ of *removing* it entirely is what actually passes detection.
 ## Features
 
 - 🚀 **Anti-fingerprint launch** — full Chromium (not headless-shell), real
-  Chrome UA, `deviceMemory=8`, spoofed `AMD Radeon` WebGL renderer
+  Chrome UA, `deviceMemory=8`, spoofed `AMD Radeon` WebGL renderer, coherent
+  windowed geometry (1280x600 viewport inside a 1366x768 screen, with the
+  outer window reserving real browser chrome — headless reports
+  `outer == inner`, a geometry tell anti-bot systems probe)
 - 🧩 **UA-CH consistency** — `navigator.userAgentData` spoofed to match the
   Chrome UA: `Google Chrome` brand present and `uaFullVersion` synced to the
   UA version (headless builds omit the flagship brand and report a stale
@@ -61,7 +64,10 @@ of *removing* it entirely is what actually passes detection.
   cross-check (Notification.permission vs permissions.query),
   media-device enumeration, WebRTC ICE leak probe, audio fingerprint,
   standard font availability, locale/languages cross-check, screen
-  plausibility, timezone-surface consistency (getTimezoneOffset vs
+  plausibility, window geometry consistency (outer > inner with plausible
+  chrome deltas, window position + outer size fits the screen — headless
+  reports `outer == inner`), timezone-surface consistency
+  (getTimezoneOffset vs
   Date.toString vs Intl offset name — partial timezone spoofs leave the
   surfaces disagreeing), navigator.pdfViewerEnabled) plus a **wire-level
   header probe** (CDP) that cross-checks
