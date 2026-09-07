@@ -46,6 +46,17 @@ async () => {
   r.maxTouchPoints = navigator.maxTouchPoints;
   r.devicePixelRatio = window.devicePixelRatio;
   r.viewportDelta = window.outerWidth - window.innerWidth;
+  // Window geometry surfaces: a real windowed browser reserves browser
+  // chrome (window borders + tab strip + URL bar) between the viewport and
+  // the outer window, and the whole window (position + outer size) must
+  // fit on the screen. Headless reports outer == inner (no real OS window)
+  // — analyze_report cross-checks all of these surfaces together.
+  r.innerWidth = window.innerWidth;
+  r.innerHeight = window.innerHeight;
+  r.outerWidth = window.outerWidth;
+  r.outerHeight = window.outerHeight;
+  r.screenX = window.screenX;
+  r.screenY = window.screenY;
   r.timezoneOffset = new Date().getTimezoneOffset();
   r.timezoneName = Intl.DateTimeFormat().resolvedOptions().timeZone;
   // Timezone surface consistency: real Chrome derives getTimezoneOffset(),
@@ -961,6 +972,55 @@ def analyze_report(results: dict) -> dict:
             f"no timezone surface readable ({desc})",
             "all surfaces agree")
 
+    # Window geometry consistency: a real windowed browser reserves window
+    # borders + tab strip + URL bar between the viewport and the outer
+    # window (outer > inner on both axes), and the whole window — position
+    # plus outer size — must fit on the screen. Headless reports
+    # outer == inner (no real OS window) and screen == viewport, so any
+    # invariant violation is a hard tell, the same class as the
+    # WebGL1/2 and timezone surface cross-checks. Missing/unreadable
+    # geometry is 'cannot verify' (WARN), never a FAIL: a FAIL requires
+    # readable surfaces that contradict each other.
+    ow, oh = results.get("outerWidth"), results.get("outerHeight")
+    iw, ih = results.get("innerWidth"), results.get("innerHeight")
+    sw_, sh_ = results.get("screenWidth"), results.get("screenHeight")
+    sx, sy = results.get("screenX"), results.get("screenY")
+    if any(not isinstance(v, (int, float)) or isinstance(v, bool)
+           for v in (ow, oh, iw, ih)):
+        add("windowGeometry", "WARN",
+            f"window geometry unavailable (outer={ow}x{oh} inner={iw}x{ih})",
+            "outer > inner, window inside screen")
+    else:
+        ow, oh, iw, ih = (int(v) for v in (ow, oh, iw, ih))
+        violations = []
+        if ow < iw or oh < ih:
+            violations.append(
+                f"outer {ow}x{oh} smaller than inner {iw}x{ih}")
+        elif ow == iw and oh == ih:
+            violations.append(
+                "outer == inner (no window chrome — headless geometry)")
+        if isinstance(sw_, (int, float)) and isinstance(sh_, (int, float)) \
+                and not isinstance(sw_, bool) and not isinstance(sh_, bool):
+            sw_i, sh_i = int(sw_), int(sh_)
+            if ow > sw_i or oh > sh_i:
+                violations.append(
+                    f"outer {ow}x{oh} exceeds screen {sw_i}x{sh_i}")
+            elif (isinstance(sx, (int, float)) and isinstance(sy, (int, float))
+                    and not isinstance(sx, bool) and not isinstance(sy, bool)
+                    and (int(sx) + ow > sw_i or int(sy) + oh > sh_i)):
+                violations.append(
+                    f"window at ({int(sx)},{int(sy)}) + outer {ow}x{oh} "
+                    f"overflows screen {sw_i}x{sh_i}")
+        if violations:
+            add("windowGeometry", "FAIL",
+                "window geometry leak: " + "; ".join(violations),
+                "outer > inner, window inside screen")
+        else:
+            add("windowGeometry", "PASS",
+                f"windowed geometry coherent (outer {ow}x{oh} > inner "
+                f"{iw}x{ih}, fits screen)",
+                "outer > inner, window inside screen")
+
     # -- informational: no single right answer, useful for spotting drift ---
     # locale/languages consistency: anti-bot systems cross-check the HTTP
     # Accept-Language header against navigator.languages — a mismatch is a
@@ -1016,7 +1076,7 @@ def analyze_report(results: dict) -> dict:
         "0")
     add("devicePixelRatio", "INFO", "typically 1 on desktop",
         "1")
-    add("viewportDelta", "INFO", "outer-inner; 0 in headless, >0 windowed",
+    add("viewportDelta", "INFO", "outer-inner width; 0 in headless, >0 windowed (cross-checked by windowGeometry)",
         "> 0 windowed")
     add("canvas", "INFO", "render fingerprint hash; stable across runs",
         "stable hash")
