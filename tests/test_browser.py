@@ -368,8 +368,9 @@ def test_stealth_init_registers_tostring_shim():
     assert "makeNative" in STEALTH_INIT
     assert "[native code]" in STEALTH_INIT
     # every injection point must be routed through makeNative
-    assert STEALTH_INIT.count("makeNative(") >= 6  # shim + deviceMemory
+    assert STEALTH_INIT.count("makeNative(") >= 8  # shim + deviceMemory
     # + 2x getParameter + userAgentData getter(s) + henv + toJSON
+    # + outerWidth/outerHeight geometry getters
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
@@ -391,6 +392,46 @@ def test_stealth_init_js_syntax():
 # --------------------------------------------------------------------------
 # open_browser smoke (headless Chromium) — skip if patchright missing
 # --------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_window_geometry_spoof_main_world():
+    """The geometry spoof must be visible in the page's main world.
+
+    open_browser pairs a 1280x600 viewport with a 1366x768 screen and the
+    STEALTH_INIT outer getters reserve window chrome (borders + tab strip
+    + URL bar), so the page sees a coherent windowed profile: outer >
+    inner, outer inside the screen, and native-looking getters.
+    """
+    patchright = pytest.importorskip("patchright")
+    from stealth_browser.browser import apply_stealth, open_browser
+
+    p, browser, ctx, profile_dir = await open_browser()
+    try:
+        page = await ctx.new_page()
+        await page.goto("about:blank")
+        await apply_stealth(page)
+        g = await page.evaluate(
+            """() => ({
+                innerW: innerWidth, innerH: innerHeight,
+                outerW: outerWidth, outerH: outerHeight,
+                screenW: screen.width, screenH: screen.height,
+                ots: Object.getOwnPropertyDescriptor(window, 'outerHeight')
+                     .get.toString(),
+            })"""
+        )
+        assert g["innerW"] == 1280 and g["innerH"] == 600
+        assert g["screenW"] == 1366 and g["screenH"] == 768
+        # windowed: outer reserves browser chrome on both axes
+        assert g["outerW"] == 1296 and g["outerH"] == 680
+        # and the whole window fits on the screen
+        assert g["outerW"] <= g["screenW"] and g["outerH"] <= g["screenH"]
+        # the getter must survive toString probing (registered native)
+        assert "[native code]" in g["ots"]
+        assert "spoof" not in g["ots"]
+    finally:
+        await browser.close()
+        await p.stop()
+
+
 @pytest.mark.asyncio
 async def test_open_browser_smoke():
     patchright = pytest.importorskip("patchright")
