@@ -93,6 +93,14 @@ def _clean_results():
         "audioSampleRate": 48000,
         "audioAllZeros": False,
         "workerWebdriver": None,
+        # worker timezone cross-check: workers get fresh Date/Intl from the
+        # engine — must agree with the main-frame surfaces above
+        "workerTimezoneOffset": -480,
+        "workerTimezoneName": "Asia/Shanghai",
+        # instance-level webdriver descriptor + host-object identity probes
+        "webdriverOwnProp": "none",
+        "pluginsConstructor": "[object PluginArray]",
+        "mimeTypesConstructor": "[object MimeTypeArray]",
         "webrtcLeak": {"status": "done", "mdns": 3, "privateIp": 0,
                         "publicIp": 1, "other": 0, "total": 4},
         # native toString consistency (spoof-source leak probes): every
@@ -231,6 +239,12 @@ def test_new_checks_missing_keys_warn_not_crash():
     assert a["checks"]["webrtcLeak"]["status"] == "WARN"
     # webdriver-family checks treat None as clean absence (same as iframe)
     assert a["checks"]["workerWebdriver"]["status"] == "PASS"
+    assert a["checks"]["webdriverOwnProp"]["status"] == "PASS"
+    # worker timezone cross-check + host-object identity degrades to WARN
+    assert a["checks"]["workerTimezoneOffset"]["status"] == "WARN"
+    assert a["checks"]["workerTimezoneName"]["status"] == "WARN"
+    assert a["checks"]["pluginsConstructor"]["status"] == "WARN"
+    assert a["checks"]["mimeTypesConstructor"]["status"] == "WARN"
     # permission-surface cross-check + media/mime realism
     assert a["checks"]["notificationPermission"]["status"] == "WARN"
     assert a["checks"]["mimeTypes"]["status"] == "WARN"
@@ -718,6 +732,128 @@ def test_worker_ua_missing_warns():
     del r["workerUserAgent"]
     a = analyze_report(r)
     assert a["checks"]["workerUserAgent"]["status"] == "WARN"
+
+
+# --------------------------------------------------------------------------
+# analyze_report — worker timezone cross-check (cross-realm spoof leaks)
+# --------------------------------------------------------------------------
+def test_worker_timezone_match_passes():
+    a = analyze_report(_clean_results())
+    assert a["checks"]["workerTimezoneOffset"]["status"] == "PASS"
+    assert a["checks"]["workerTimezoneName"]["status"] == "PASS"
+
+
+def test_worker_timezone_offset_mismatch_is_flagged():
+    """A timezone patch layered in the main world (init script/extension)
+    never reaches workers' fresh Date objects — the offsets disagree."""
+    r = _clean_results()
+    r["workerTimezoneOffset"] = 300
+    a = analyze_report(r)
+    assert a["checks"]["workerTimezoneOffset"]["status"] == "FAIL"
+    assert a["summary"]["verdict"] == "flagged"
+
+
+def test_worker_timezone_name_mismatch_is_flagged():
+    r = _clean_results()
+    r["workerTimezoneName"] = "America/New_York"
+    a = analyze_report(r)
+    assert a["checks"]["workerTimezoneName"]["status"] == "FAIL"
+    assert a["summary"]["verdict"] == "flagged"
+
+
+def test_worker_timezone_float_offset_normalizes():
+    """Engines may hand back 480.0 — the comparison must still match."""
+    r = _clean_results()
+    r["workerTimezoneOffset"] = -480.0
+    r["timezoneOffset"] = -480.0
+    a = analyze_report(r)
+    assert a["checks"]["workerTimezoneOffset"]["status"] == "PASS"
+
+
+def test_worker_timezone_unreadable_warns():
+    """Error/timeout strings are 'cannot verify', never a leak."""
+    r = _clean_results()
+    r["workerTimezoneOffset"] = "timeout"
+    r["workerTimezoneName"] = "err:RangeError"
+    a = analyze_report(r)
+    assert a["checks"]["workerTimezoneOffset"]["status"] == "WARN"
+    assert a["checks"]["workerTimezoneName"]["status"] == "WARN"
+    assert a["summary"]["verdict"] == "attention"
+
+
+def test_worker_timezone_missing_warns():
+    r = _clean_results()
+    del r["workerTimezoneOffset"]
+    del r["workerTimezoneName"]
+    a = analyze_report(r)
+    assert a["checks"]["workerTimezoneOffset"]["status"] == "WARN"
+    assert a["checks"]["workerTimezoneName"]["status"] == "WARN"
+
+
+# --------------------------------------------------------------------------
+# analyze_report — instance-level webdriver descriptor + host-object identity
+# --------------------------------------------------------------------------
+def test_webdriver_own_prop_clean_passes():
+    """Real Chrome keeps webdriver on the prototype (patchright removes it
+    there) — the instance carries no own property."""
+    a = analyze_report(_clean_results())
+    assert a["checks"]["webdriverOwnProp"]["status"] == "PASS"
+
+
+def test_webdriver_own_prop_getter_is_flagged():
+    """Layered spoof: defineProperty(navigator, 'webdriver', {get: ...})."""
+    r = _clean_results()
+    r["webdriverOwnProp"] = "own-getter"
+    a = analyze_report(r)
+    assert a["checks"]["webdriverOwnProp"]["status"] == "FAIL"
+    assert a["summary"]["verdict"] == "flagged"
+
+
+def test_webdriver_own_prop_value_is_flagged():
+    r = _clean_results()
+    r["webdriverOwnProp"] = "own-value"
+    a = analyze_report(r)
+    assert a["checks"]["webdriverOwnProp"]["status"] == "FAIL"
+
+
+def test_webdriver_own_prop_error_warns():
+    r = _clean_results()
+    r["webdriverOwnProp"] = "err:TypeError"
+    a = analyze_report(r)
+    assert a["checks"]["webdriverOwnProp"]["status"] == "WARN"
+
+
+def test_host_object_identity_clean_passes():
+    a = analyze_report(_clean_results())
+    assert a["checks"]["pluginsConstructor"]["status"] == "PASS"
+    assert a["checks"]["mimeTypesConstructor"]["status"] == "PASS"
+
+
+def test_js_array_plugin_spoof_is_flagged():
+    """A plain JS array of the right length fails the PluginArray identity
+    probe even when the fabricated names look right."""
+    r = _clean_results()
+    r["pluginsConstructor"] = "[object Array]"
+    a = analyze_report(r)
+    assert a["checks"]["pluginsConstructor"]["status"] == "FAIL"
+    assert a["summary"]["verdict"] == "flagged"
+
+
+def test_js_array_mimetypes_spoof_is_flagged():
+    r = _clean_results()
+    r["mimeTypesConstructor"] = "[object Array]"
+    a = analyze_report(r)
+    assert a["checks"]["mimeTypesConstructor"]["status"] == "FAIL"
+
+
+def test_host_object_identity_missing_warn_not_crash():
+    r = _clean_results()
+    del r["pluginsConstructor"]
+    del r["mimeTypesConstructor"]
+    a = analyze_report(r)
+    assert a["checks"]["pluginsConstructor"]["status"] == "WARN"
+    assert a["checks"]["mimeTypesConstructor"]["status"] == "WARN"
+    assert a["summary"]["verdict"] != "flagged"
 
 
 def test_webrtc_raw_private_ip_is_flagged():
@@ -1311,6 +1447,9 @@ def test_checks_js_executes_without_reference_errors():
           || !('audioFingerprint' in r) || !('audioSampleRate' in r)
           || !('audioAllZeros' in r)
           || !('workerWebdriver' in r) || !('workerUserAgent' in r)
+          || !('workerTimezoneOffset' in r) || !('workerTimezoneName' in r)
+          || !('webdriverOwnProp' in r)
+          || !('pluginsConstructor' in r) || !('mimeTypesConstructor' in r)
           || !('webrtcLeak' in r)
           || !('fnToStringSelf' in r) || !('webglToString' in r)
           || !('webgl2ToString' in r) || !('deviceMemoryGetter' in r)
