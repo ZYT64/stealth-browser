@@ -22,6 +22,19 @@ CHECKS = r"""
 async () => {
   const r = {};
   r.webdriver = navigator.webdriver;
+  // Instance-level webdriver descriptor: a real navigator has no *own*
+  // 'webdriver' property — Chrome defines it on Navigator.prototype, and
+  // patchright removes it from the prototype entirely. Older stealth
+  // scripts layer `Object.defineProperty(navigator, 'webdriver', ...)` on
+  // top of that; the resulting own-property descriptor is exactly what
+  // descriptor-probing detectors read to expose layered spoofs.
+  r.webdriverOwnProp = (() => {
+    try {
+      const d = Object.getOwnPropertyDescriptor(navigator, 'webdriver');
+      if (!d) return 'none';
+      return d.get ? 'own-getter' : 'own-value';
+    } catch (e) { return 'err:' + e.name; }
+  })();
   r.languages = navigator.languages;
   r.plugins = navigator.plugins.length;
   // pdfViewerEnabled (Chrome 106+): reflects the bundled PDF viewer. Real
@@ -195,6 +208,23 @@ async () => {
     try { return Array.from(navigator.mimeTypes, (m) => m.type); }
     catch (e) { return 'err:' + e.name; }
   })();
+  // Plugin/MimeType host-object identity: real Chrome exposes PluginArray /
+  // MimeTypeArray instances, not JS arrays. A length-only spoof assembled
+  // from a plain array gets the count and even the names right but fails
+  // the Object.prototype.toString identity probe (pairs with the
+  // pluginNames/mimeTypes realism checks above).
+  r.pluginsConstructor = (() => {
+    try {
+      if (!navigator.plugins || navigator.plugins.length === 0) return 'no-plugins';
+      return Object.prototype.toString.call(navigator.plugins);
+    } catch (e) { return 'err:' + e.name; }
+  })();
+  r.mimeTypesConstructor = (() => {
+    try {
+      if (!navigator.mimeTypes || navigator.mimeTypes.length === 0) return 'no-mimetypes';
+      return Object.prototype.toString.call(navigator.mimeTypes);
+    } catch (e) { return 'err:' + e.name; }
+  })();
   // Standard font availability: minimal bot containers ship no fonts, real
   // desktops have Arial/Times/etc (Linux maps them via fontconfig). Metric
   // based detection (same idea as fingerprintjs): the probe font is
@@ -256,45 +286,54 @@ async () => {
     } catch (e) { return 'err:' + e.name; }
   })();
   // Web Worker context probe: anti-bot patches that only cover the main
-  // world leak inside workers, where the page gets a fresh navigator.
-  // fingerprintjs probes worker-scoped values for exactly this reason. We
-  // check both webdriver and the UA string (a UA spoof that misses workers
-  // leaks the headless UA there). Blob-URL workers work on any origin.
+  // world leak inside workers, where the page gets a fresh navigator AND
+  // fresh Date/Intl objects — init-script timezone patches never reach
+  // them. We check webdriver, the UA string and the timezone (offset +
+  // Intl name) for exactly this reason; fingerprintjs and creepjs both
+  // probe worker-scoped values. Blob-URL workers work on any origin.
   r.workerWebdriver = null;
   r.workerUserAgent = null;
+  r.workerTimezoneOffset = null;
+  r.workerTimezoneName = null;
   await new Promise((resolve) => {
     try {
       if (typeof Worker === 'undefined') {
         r.workerWebdriver = 'no-worker';
+        r.workerTimezoneOffset = 'no-worker';
+        r.workerTimezoneName = 'no-worker';
         resolve();
         return;
       }
-      const src = "postMessage({wd: navigator.webdriver, ua: navigator.userAgent});";
+      const src = "postMessage({wd: navigator.webdriver, ua: navigator.userAgent, " +
+        "tz: new Date().getTimezoneOffset(), " +
+        "tzName: Intl.DateTimeFormat().resolvedOptions().timeZone});";
       const url = URL.createObjectURL(new Blob([src], {type: 'application/javascript'}));
       const w = new Worker(url);
       let done = false;
-      const finish = (wd, ua) => {
+      const finish = (wd, ua, tz, tzName) => {
         if (done) return;
         done = true;
         try { w.terminate(); } catch (e) {}
         try { URL.revokeObjectURL(url); } catch (e) {}
         r.workerWebdriver = wd === undefined ? null : String(wd);
         r.workerUserAgent = ua === undefined ? null : String(ua);
+        r.workerTimezoneOffset = (tz === undefined || tz === null) ? null : Number(tz);
+        r.workerTimezoneName = tzName === undefined ? null : String(tzName);
         resolve();
       };
       w.onmessage = (ev) => {
         try {
           const d = ev.data || {};
-          finish(d.wd, d.ua);
+          finish(d.wd, d.ua, d.tz, d.tzName);
         } catch (e) {
           if (!done) { r.workerWebdriver = 'err:' + e.name; finish(); }
         }
       };
       w.onerror = () => { if (!done) r.workerWebdriver = 'err:worker'; finish(); };
-      setTimeout(() => {
-        if (!done && r.workerWebdriver === null) r.workerWebdriver = 'timeout';
-        finish();
-      }, 1500);
+      // Pass a string sentinel (not undefined) so finish() records the
+      // timeout instead of overwriting it with null — the worker really
+      // did not answer, which is 'cannot verify', never 'verified clean'.
+      setTimeout(() => { if (!done) finish('timeout'); }, 1500);
     } catch (e) {
       r.workerWebdriver = 'err:' + e.name;
       resolve();
@@ -523,6 +562,25 @@ def analyze_report(results: dict) -> dict:
         add("iframeWebdriver", "FAIL", f"iframe leaks webdriver={ifw}", "absent")
     else:
         add("iframeWebdriver", "WARN", f"cannot verify iframe webdriver ({ifw})", "absent")
+    # Instance-level webdriver descriptor: a real navigator has no *own*
+    # 'webdriver' property — Chrome defines it on Navigator.prototype and
+    # patchright removes it entirely. A layered JS spoof (defineProperty on
+    # the instance) leaves an own-property descriptor behind, which
+    # descriptor-probing detectors read directly. Same None-is-clean
+    # convention as the iframe/worker webdriver checks (verified absence,
+    # not missing data).
+    wop = results.get("webdriverOwnProp")
+    if wop is None or str(wop) == "none":
+        add("webdriverOwnProp", "PASS",
+            "no instance-level webdriver spoof (prototype-removed)", "none")
+    elif str(wop) in ("own-getter", "own-value"):
+        add("webdriverOwnProp", "FAIL",
+            f"own-property webdriver descriptor present ({wop}) — layered "
+            "defineProperty spoof that descriptor-probing detectors read",
+            "none")
+    else:
+        add("webdriverOwnProp", "WARN",
+            f"cannot read webdriver descriptor ({wop})", "none")
     if "HeadlessChrome" in str(results.get("userAgent", "")):
         add("userAgent", "FAIL", "HeadlessChrome leak in UA", "no 'HeadlessChrome'")
     else:
@@ -659,6 +717,52 @@ def analyze_report(results: dict) -> dict:
         add("workerUserAgent", "FAIL",
             f"worker UA differs from main frame — worker-scope spoof leak ({str(wua)[:60]})",
             "matches main frame UA")
+    # Worker timezone cross-check: dedicated workers get fresh Date/Intl
+    # objects from the engine — an init-script timezone patch (or extension
+    # content script) never reaches them. Two readable surfaces that
+    # disagree is a hard FAIL, the same class as the worker UA check;
+    # unreadable/missing degrades to WARN ('cannot verify', never a leak).
+    wtz = results.get("workerTimezoneOffset")
+    mtz = results.get("timezoneOffset")
+    if isinstance(mtz, float) and mtz.is_integer():
+        mtz = int(mtz)
+    if isinstance(wtz, float) and wtz.is_integer():
+        wtz = int(wtz)
+    if wtz is None:
+        add("workerTimezoneOffset", "WARN", "worker timezone offset unavailable",
+            "matches main frame timezone")
+    elif isinstance(wtz, int) and isinstance(mtz, int):
+        if wtz == mtz:
+            add("workerTimezoneOffset", "PASS",
+                f"worker timezone offset ({wtz}) matches the main frame",
+                "matches main frame timezone")
+        else:
+            add("workerTimezoneOffset", "FAIL",
+                f"worker timezone offset {wtz} disagrees with the main frame "
+                f"({mtz}) — worker-scope timezone spoof leak",
+                "matches main frame timezone")
+    else:
+        add("workerTimezoneOffset", "WARN",
+            f"cannot verify worker timezone ({wtz})", "matches main frame timezone")
+    wtzn = results.get("workerTimezoneName")
+    mtzn = results.get("timezoneName")
+    if wtzn is None:
+        add("workerTimezoneName", "WARN", "worker timezone name unavailable",
+            "matches main frame timezone")
+    elif (isinstance(wtzn, str) and isinstance(mtzn, str)
+          and not wtzn.startswith(("err:", "no-worker", "timeout"))):
+        if wtzn == mtzn:
+            add("workerTimezoneName", "PASS",
+                f"worker Intl timezone ({wtzn}) matches the main frame",
+                "matches main frame timezone")
+        else:
+            add("workerTimezoneName", "FAIL",
+                f"worker Intl timezone {wtzn} disagrees with the main frame "
+                f"({mtzn}) — worker-scope timezone spoof leak",
+                "matches main frame timezone")
+    else:
+        add("workerTimezoneName", "WARN",
+            f"cannot verify worker timezone name ({wtzn})", "matches main frame timezone")
     # WebRTC: raw local IPs in ICE candidates are an IP-consistency leak
     # (the real machine IP readable by page scripts, e.g. behind a proxy).
     wrtc = results.get("webrtcLeak")
@@ -878,6 +982,25 @@ def analyze_report(results: dict) -> dict:
     else:
         add("mimeTypes", "PASS", f"navigator.mimeTypes reports {mt} entries",
             "PDF mime types present")
+    # Plugin/MimeType host-object identity: real Chrome exposes PluginArray
+    # / MimeTypeArray instances, not JS arrays. A length-only spoof
+    # assembled from a plain array gets the count (and even names) right
+    # but fails the Object.prototype.toString identity probe — pairs with
+    # the pluginNames/mimeTypes realism checks above.
+    for key, kind, label in (("pluginsConstructor", "PluginArray", "plugins"),
+                             ("mimeTypesConstructor", "MimeTypeArray",
+                              "mimeTypes")):
+        sc = results.get(key)
+        sv = str(sc) if sc is not None else ""
+        if sc is None or sv in ("no-plugins", "no-mimetypes") or sv.startswith("err:"):
+            add(key, "WARN", f"{label} host-object identity unavailable "
+                f"({sc or 'missing'})", f"[object {kind}]")
+        elif sv == f"[object {kind}]":
+            add(key, "PASS", f"{label} is a real {kind} host object",
+                f"[object {kind}]")
+        else:
+            add(key, "FAIL", f"{label} identity is {sv} — JS-array "
+                "length-only spoof", f"[object {kind}]")
     fonts = results.get("fonts")
     if isinstance(fonts, dict) and fonts:
         avail = sum(1 for v in fonts.values() if v)
