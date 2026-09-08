@@ -69,7 +69,12 @@ of *removing* it entirely is what actually passes detection.
   reports `outer == inner`), timezone-surface consistency
   (getTimezoneOffset vs
   Date.toString vs Intl offset name — partial timezone spoofs leave the
-  surfaces disagreeing), navigator.pdfViewerEnabled) plus a **wire-level
+  surfaces disagreeing), navigator.pdfViewerEnabled, Web Worker timezone
+  cross-check (workers get fresh Date/Intl from the engine — main-world
+  timezone patches never reach them), instance-level webdriver descriptor
+  probe (a layered `defineProperty` spoof leaves an own-property tell
+  behind), PluginArray/MimeTypeArray host-object identity (a JS-array
+  length-only spoof fails the toString identity probe)) plus a **wire-level
   header probe** (CDP) that cross-checks
   the HTTP `Accept-Language` header against `navigator.languages` — a
   header/JS locale mismatch is invisible to page scripts and catches
