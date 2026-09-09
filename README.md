@@ -63,6 +63,8 @@ of *removing* it entirely is what actually passes detection.
   consistency, plugin-name and MIME-type realism, permission-surface
   cross-check (Notification.permission vs permissions.query),
   media-device enumeration, WebRTC ICE leak probe, audio fingerprint,
+  canvas render integrity (blank-output and noise-injection spoof
+  detection: real renders are non-blank and byte-identical across draws),
   standard font availability, locale/languages cross-check, screen
   plausibility, window geometry consistency (outer > inner with plausible
   chrome deltas, window position + outer size fits the screen — headless
