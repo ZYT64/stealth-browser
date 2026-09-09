@@ -72,6 +72,8 @@ def _clean_results():
                         "Chromium PDF Viewer", "Microsoft Edge PDF Viewer",
                         "WebKit built-in PDF"],
         "canvas": "a1b2c3d4",
+        # canvas render integrity: valid PNG data URL, non-blank, stable
+        "canvasIntegrity": {"status": "ok", "opaque": 312, "dataUrlLen": 2210},
         # UA-CH (client hints) must match the spoofed Chrome profile
         "uaDataBrands": ('[{"brand": "Google Chrome", "version": "149"}, '
                          '{"brand": "Chromium", "version": "149"}, '
@@ -692,6 +694,84 @@ def test_unusual_sample_rate_warns():
     r["audioSampleRate"] = 8000
     a = analyze_report(r)
     assert a["checks"]["audioSampleRate"]["status"] == "WARN"
+
+
+# --------------------------------------------------------------------------
+# analyze_report — canvas render integrity
+# --------------------------------------------------------------------------
+def test_canvas_integrity_clean_passes():
+    a = analyze_report(_clean_results())
+    assert a["checks"]["canvasIntegrity"]["status"] == "PASS"
+
+
+def test_canvas_blank_is_flagged():
+    """All-transparent readback = blanking spoof / broken rasterizer."""
+    r = _clean_results()
+    r["canvasIntegrity"] = {"status": "blank", "opaque": 0, "dataUrlLen": 142}
+    a = analyze_report(r)
+    assert a["checks"]["canvasIntegrity"]["status"] == "FAIL"
+    assert a["summary"]["verdict"] == "flagged"
+
+
+def test_canvas_unstable_render_is_flagged():
+    """Two identical draws producing different data URLs = noise-injection spoof."""
+    r = _clean_results()
+    r["canvasIntegrity"] = {"status": "unstable-render", "opaque": 312,
+                             "dataUrlLen": 2210}
+    a = analyze_report(r)
+    assert a["checks"]["canvasIntegrity"]["status"] == "FAIL"
+    assert a["summary"]["verdict"] == "flagged"
+
+
+def test_canvas_unstable_readback_is_flagged():
+    """getImageData returning different bytes per call = readback noise spoof."""
+    r = _clean_results()
+    r["canvasIntegrity"] = {"status": "unstable-readback", "opaque": 312,
+                             "dataUrlLen": 2210}
+    a = analyze_report(r)
+    assert a["checks"]["canvasIntegrity"]["status"] == "FAIL"
+    assert a["summary"]["verdict"] == "flagged"
+
+
+def test_canvas_bad_data_url_is_flagged():
+    """toDataURL not returning a PNG data URL = patched canvas API."""
+    r = _clean_results()
+    r["canvasIntegrity"] = {"status": "bad-data-url"}
+    a = analyze_report(r)
+    assert a["checks"]["canvasIntegrity"]["status"] == "FAIL"
+    assert a["summary"]["verdict"] == "flagged"
+
+
+def test_canvas_probe_error_warns():
+    """A thrown probe error is 'cannot verify', never a leak."""
+    r = _clean_results()
+    r["canvasIntegrity"] = {"status": "err:TypeError"}
+    a = analyze_report(r)
+    assert a["checks"]["canvasIntegrity"]["status"] == "WARN"
+    assert a["summary"]["verdict"] == "attention"
+
+
+def test_canvas_integrity_missing_warns():
+    r = _clean_results()
+    del r["canvasIntegrity"]
+    a = analyze_report(r)
+    assert a["checks"]["canvasIntegrity"]["status"] == "WARN"
+    assert a["summary"]["verdict"] == "attention"
+
+
+def test_canvas_integrity_unreadable_warns():
+    r = _clean_results()
+    r["canvasIntegrity"] = "no-canvas"
+    a = analyze_report(r)
+    assert a["checks"]["canvasIntegrity"]["status"] == "WARN"
+    assert a["summary"]["verdict"] == "attention"
+
+
+def test_canvas_integrity_unknown_status_warns():
+    r = _clean_results()
+    r["canvasIntegrity"] = {"status": "something-new"}
+    a = analyze_report(r)
+    assert a["checks"]["canvasIntegrity"]["status"] == "WARN"
 
 
 def test_worker_webdriver_leak_is_flagged():
@@ -1440,7 +1520,8 @@ def test_checks_js_executes_without_reference_errors():
     const result = (""" + CHECKS + """)();
     result.then(r => {
       if (typeof r !== 'object' || r === null) throw new Error('not an object');
-      if (!('webdriver' in r) || !('canvas' in r) || !('permissions' in r)
+      if (!('webdriver' in r) || !('canvas' in r) || !('canvasIntegrity' in r)
+          || !('permissions' in r)
           || !('iframeWebdriver' in r) || !('fonts' in r)
           || !('webgl2' in r) || !('webgl2Vendor' in r)
           || !('pluginNames' in r)
