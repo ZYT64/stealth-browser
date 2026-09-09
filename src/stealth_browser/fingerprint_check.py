@@ -159,6 +159,58 @@ async () => {
       return h.toString(16);
     } catch (e) { return 'err'; }
   })();
+  // Canvas render integrity: the hash above says nothing about whether the
+  // render is *real*. Detection systems probe three failure modes a real
+  // rasterizer never shows: (a) blanked output — privacy-spoof patches
+  // return an all-transparent image so fingerprint reads degenerate;
+  // (b) unstable renders — noise-injection spoofs sprinkle random pixels so
+  // two identical draws differ; (c) patched toDataURL shapes (wrong prefix).
+  // We draw the same text on two canvases and compare data URLs, then read
+  // pixels back twice. Only verdicts and counts leave this probe — no raw
+  // pixels or data URLs in the JSON report (same bucketing rule as the
+  // plugin/media/WebRTC probes).
+  r.canvasIntegrity = (() => {
+    try {
+      const draw = () => {
+        const c = document.createElement('canvas');
+        c.width = 220; c.height = 30;
+        const ctx = c.getContext('2d');
+        ctx.textBaseline = 'top';
+        ctx.font = '14px Arial';
+        ctx.fillStyle = '#336699';
+        ctx.fillText('stealth-browser fingerprint 1234567890', 2, 2);
+        return c;
+      };
+      const c1 = draw();
+      const url1 = c1.toDataURL();
+      if (typeof url1 !== 'string' || !url1.startsWith('data:image/png;base64,')) {
+        return {status: 'bad-data-url'};
+      }
+      const data1 = c1.getContext('2d').getImageData(0, 0, 220, 30).data;
+      let opaque = 0;
+      for (let i = 3; i < data1.length; i += 4) {
+        if (data1[i] !== 0) opaque++;
+      }
+      if (opaque === 0) {
+        return {status: 'blank', opaque, dataUrlLen: url1.length};
+      }
+      const data2 = c1.getContext('2d').getImageData(0, 0, 220, 30).data;
+      let readbackMatch = data1.length === data2.length;
+      if (readbackMatch) {
+        for (let i = 0; i < data1.length; i++) {
+          if (data1[i] !== data2[i]) { readbackMatch = false; break; }
+        }
+      }
+      if (!readbackMatch) {
+        return {status: 'unstable-readback', opaque, dataUrlLen: url1.length};
+      }
+      const url2 = draw().toDataURL();
+      if (url2 !== url1) {
+        return {status: 'unstable-render', opaque, dataUrlLen: url1.length};
+      }
+      return {status: 'ok', opaque, dataUrlLen: url1.length};
+    } catch (e) { return {status: 'err:' + e.name}; }
+  })();
   // -- extended surface checks ---------------------------------------------
   // webdriver inside a same-origin about:blank iframe: stealth patches that
   // only cover the top frame (or init scripts stuck in an isolated world)
@@ -695,6 +747,50 @@ def analyze_report(results: dict) -> dict:
         add("audioSampleRate", "WARN", "sample rate unavailable", "44100|48000")
     else:
         add("audioSampleRate", "WARN", f"unusual sample rate {sr} Hz", "44100|48000")
+    # Canvas render integrity: a real rasterizer returns a valid PNG data
+    # URL, non-blank pixels, and identical output for identical draws.
+    # Blanking spoofs (privacy patches) read back all-transparent; noise-
+    # injection spoofs make two identical renders differ — both are classic
+    # canvas-health tells (fingerprintjs/creepjs probe this surface), and a
+    # spoof that patches canvas output shape (non-PNG data URL) fails here
+    # too. Missing/errored means 'cannot verify', never a leak.
+    ci = results.get("canvasIntegrity")
+    if ci is None:
+        add("canvasIntegrity", "WARN", "canvas integrity probe unavailable (missing)",
+            "valid, non-blank, stable render")
+    elif not isinstance(ci, dict):
+        add("canvasIntegrity", "WARN", f"canvas integrity probe failed ({ci})",
+            "valid, non-blank, stable render")
+    else:
+        st = str(ci.get("status", ""))
+        if st.startswith("err:"):
+            add("canvasIntegrity", "WARN", f"canvas probe error ({st})",
+                "valid, non-blank, stable render")
+        elif st == "bad-data-url":
+            add("canvasIntegrity", "FAIL",
+                "toDataURL did not return a PNG data URL — patched canvas API",
+                "data:image/png data URL")
+        elif st == "blank":
+            add("canvasIntegrity", "FAIL",
+                f"canvas render is blank ({ci.get('opaque', 0)} opaque pixels) "
+                "— blanking spoof or broken rasterizer",
+                "non-blank render")
+        elif st == "unstable-readback":
+            add("canvasIntegrity", "FAIL",
+                "getImageData returns different bytes per call — readback noise spoof",
+                "stable render")
+        elif st == "unstable-render":
+            add("canvasIntegrity", "FAIL",
+                "identical draws produce different data URLs — noise-injection spoof",
+                "stable render")
+        elif st == "ok":
+            add("canvasIntegrity", "PASS",
+                f"canvas render readable and stable ({ci.get('opaque')} text "
+                f"pixels, data URL {ci.get('dataUrlLen')}B)",
+                "valid, non-blank, stable render")
+        else:
+            add("canvasIntegrity", "WARN", f"unknown canvas integrity status ({st})",
+                "valid, non-blank, stable render")
     # Worker context: patches that only cover the main world leak inside
     # Web Workers (a fresh navigator object). Same None-is-clean convention
     # as the iframe webdriver check (verified absence, not missing data).
@@ -1201,7 +1297,8 @@ def analyze_report(results: dict) -> dict:
         "1")
     add("viewportDelta", "INFO", "outer-inner width; 0 in headless, >0 windowed (cross-checked by windowGeometry)",
         "> 0 windowed")
-    add("canvas", "INFO", "render fingerprint hash; stable across runs",
+    add("canvas", "INFO", "render fingerprint hash; stable across runs "
+        "(health cross-checked by canvasIntegrity)",
         "stable hash")
     add("chrome", "INFO", f"window.chrome present: {bool(results.get('chrome'))}",
         "True")
