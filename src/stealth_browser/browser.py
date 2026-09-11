@@ -169,11 +169,51 @@ STEALTH_INIT_TMPL = """
 """
 
 _UA_VER = re.search(r"Chrome/(\d+\.\d+\.\d+\.\d+)", REAL_UA)
+_UA_MAJOR = _UA_VER.group(1).split(".")[0]
+_UA_FULL = _UA_VER.group(1)
 STEALTH_INIT = (
     STEALTH_INIT_TMPL
-    .replace("__UA_FULL__", _UA_VER.group(1))
-    .replace("__UA_MAJOR__", _UA_VER.group(1).split(".")[0])
+    .replace("__UA_FULL__", _UA_FULL)
+    .replace("__UA_MAJOR__", _UA_MAJOR)
 )
+
+# Context locale: navigator.languages, the wire Accept-Language header and
+# the acceptLanguage pinned in the UA metadata override (apply_wire_ua)
+# must all agree — define once here.
+LOCALE = "zh-CN"
+
+# Engine-side UA metadata (CDP Network.setUserAgentOverride): Chrome
+# generates the wire-level Sec-CH-UA / Sec-CH-UA-Mobile / Sec-CH-UA-Platform
+# request headers from this metadata, NOT from the user_agent string. A
+# plain user_agent override does not touch it — patchright derives only
+# platform/mobile from the UA and leaves brands empty, so the wire kept
+# advertising the real build (e.g. "Chromium";v="151", no Google Chrome
+# brand) while the JS spoof claimed Chrome 149: a wire/JS mismatch that
+# server-side anti-bot systems probe for and that no in-page JS check can
+# see. This table mirrors the JS userAgentData spoof in STEALTH_INIT
+# (same brands, same versions, same grease) so the two surfaces can never
+# drift apart; the fingerprint check's httpSecChUa cross-check compares
+# exactly this pair.
+USER_AGENT_METADATA = {
+    "brands": [
+        {"brand": "Google Chrome", "version": _UA_MAJOR},
+        {"brand": "Chromium", "version": _UA_MAJOR},
+        {"brand": "Not)A;Brand", "version": "24"},
+    ],
+    "fullVersionList": [
+        {"brand": "Google Chrome", "version": _UA_FULL},
+        {"brand": "Chromium", "version": _UA_FULL},
+        {"brand": "Not)A;Brand", "version": "24.0.0.0"},
+    ],
+    "fullVersion": _UA_FULL,
+    "platform": "Linux",
+    "platformVersion": "",
+    "architecture": "x86",
+    "bitness": "64",
+    "model": "",
+    "mobile": False,
+    "wow64": False,
+}
 
 
 async def apply_stealth(page) -> None:
@@ -186,6 +226,56 @@ async def apply_stealth(page) -> None:
     the clean profile. Idempotent — safe to call after every navigation.
     """
     await page.evaluate(STEALTH_INIT)
+
+
+# Persistent CDP sessions carrying the wire UA override (apply_wire_ua).
+# The browser-side UA override is owned by the DevTools session that set it
+# — detaching the session reverts the wire client hints to the real build —
+# so each override session must stay open for its page's lifetime. Keyed by
+# page weakly: repeated calls reuse the session, closed pages release theirs.
+_wire_ua_sessions: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+async def apply_wire_ua(page) -> None:
+    """Align the engine's wire-level UA client hints with REAL_UA (CDP).
+
+    Chrome generates the Sec-CH-UA / Sec-CH-UA-Mobile / Sec-CH-UA-Platform
+    request headers from engine-side UA metadata — see USER_AGENT_METADATA
+    for why a plain user_agent override leaves the wire advertising the
+    real build. This override sets the full metadata (mirroring the JS
+    userAgentData spoof) plus the accept-language the context locale
+    implies, so wire and JS agree on every request of this page.
+
+    The browser-side override is owned by the DevTools session that set it:
+    detaching the session reverts the wire to the real build (verified
+    empirically), so the session deliberately stays open for the page's
+    lifetime and is tracked in _wire_ua_sessions — repeated calls re-assert
+    on the same session, and a closed page releases its own. Best effort by
+    design: any failure is swallowed and the fingerprint check's wire-level
+    cross-check reports the resulting mismatch instead of the launch flow
+    breaking.
+    """
+    try:
+        cdp = _wire_ua_sessions.get(page)
+    except TypeError:
+        cdp = None  # page not weakref-able — fall through to a fresh session
+    if cdp is None:
+        try:
+            cdp = await page.context.new_cdp_session(page)
+        except Exception:
+            return
+        try:
+            _wire_ua_sessions[page] = cdp
+        except TypeError:
+            pass  # page not weakref-able — session just isn't reused
+    try:
+        await cdp.send("Network.setUserAgentOverride", {
+            "userAgent": REAL_UA,
+            "acceptLanguage": LOCALE,
+            "userAgentMetadata": USER_AGENT_METADATA,
+        })
+    except Exception:
+        pass  # best effort — the wire cross-check reports any mismatch
 
 
 # --------------------------------------------------------------------------
@@ -484,13 +574,18 @@ async def open_browser(profile_name: str = "default", headless: bool = True):
     # the window-geometry cross-check in fingerprint_check.
     ctx = await browser.new_context(
         user_agent=REAL_UA,
-        locale="zh-CN",
+        locale=LOCALE,
         timezone_id="Asia/Shanghai",
         viewport={"width": 1280, "height": 600},
         screen={"width": 1366, "height": 768},
         storage_state=str(storage) if storage.exists() else None,
     )
     await ctx.add_init_script(STEALTH_INIT)
+    # Wire-level UA client hints: every page (including popups) gets the
+    # full UA metadata override as soon as it exists — best effort, the
+    # first-party command flows additionally call apply_wire_ua
+    # deterministically before their first navigation.
+    ctx.on("page", lambda page: asyncio.ensure_future(apply_wire_ua(page)))
     return p, browser, ctx, profile_dir
 
 
@@ -507,6 +602,10 @@ async def cmd_check(args) -> None:
 
     p, browser, ctx, _ = await open_browser(args.profile)
     page = await ctx.new_page()
+    # Deterministic wire-hint alignment BEFORE the first navigation: the
+    # document request itself must already carry coherent Sec-CH-UA headers
+    # (the ctx.on("page") handler in open_browser is best-effort only).
+    await apply_wire_ua(page)
     # A real document is required: init scripts don't run on about:blank and
     # permission states are meaningless there. example.com is a neutral,
     # dependency-free probe page; if offline we fall back to a blank doc.
@@ -561,6 +660,7 @@ async def cmd_check(args) -> None:
 async def cmd_dump(args) -> None:
     p, browser, ctx, profile_dir = await open_browser(args.profile)
     page = await ctx.new_page()
+    await apply_wire_ua(page)
     await page.goto(args.url, wait_until="domcontentloaded", timeout=45000)
     await apply_stealth(page)
     await page.wait_for_timeout(random.randint(1500, 3500))
@@ -575,6 +675,7 @@ async def cmd_dump(args) -> None:
 async def cmd_open(args) -> None:
     p, browser, ctx, profile_dir = await open_browser(args.profile)
     page = await ctx.new_page()
+    await apply_wire_ua(page)
     await page.goto(args.url, wait_until="domcontentloaded", timeout=45000)
     await apply_stealth(page)
     await human_move(page)
@@ -598,6 +699,7 @@ async def cmd_open(args) -> None:
 async def cmd_snapshot(args) -> None:
     p, browser, ctx, profile_dir = await open_browser(args.profile)
     page = await ctx.new_page()
+    await apply_wire_ua(page)
     await page.goto(args.url, wait_until="networkidle", timeout=45000)
     await apply_stealth(page)
     await human_scroll(page)
