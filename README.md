@@ -41,7 +41,11 @@ of *removing* it entirely is what actually passes detection.
 - 🧩 **UA-CH consistency** — `navigator.userAgentData` spoofed to match the
   Chrome UA: `Google Chrome` brand present and `uaFullVersion` synced to the
   UA version (headless builds omit the flagship brand and report a stale
-  build number — both are bot tells)
+  build number — both are bot tells). The engine's **wire-level client
+  hints** (`Sec-CH-UA` request headers) are aligned too, via a full
+  `userAgentMetadata` CDP override derived from the same UA: a plain UA
+  override leaves the wire advertising the real build while JS claims the
+  spoof — a mismatch server-side detectors probe for
 - 🛡️ **Native toString hardening** — every injected function (WebGL
   `getParameter` patches, `deviceMemory`/`userAgentData` getters, UA-CH
   methods) is registered with a `Function.prototype.toString` shim so
@@ -78,9 +82,12 @@ of *removing* it entirely is what actually passes detection.
   behind), PluginArray/MimeTypeArray host-object identity (a JS-array
   length-only spoof fails the toString identity probe)) plus a **wire-level
   header probe** (CDP) that cross-checks
-  the HTTP `Accept-Language` header against `navigator.languages` — a
-  header/JS locale mismatch is invisible to page scripts and catches
-  JS-only locale spoofs and header-rewriting proxies + optional sannysoft
+  the HTTP `Accept-Language` header against `navigator.languages` and the
+  default `Sec-CH-UA` / `Sec-CH-UA-Mobile` / `Sec-CH-UA-Platform` client
+  hint headers against `navigator.userAgentData` — wire/JS mismatches are
+  invisible to page scripts and catch JS-only locale/UA-CH spoofs,
+  header-rewriting proxies and UA overrides that leave the engine's client
+  hints behind + optional sannysoft
   remote scan
 - 🌐 **Configurable** — locale, timezone, viewport, custom UA all exposed
 
@@ -174,6 +181,7 @@ src/stealth_browser/
 | UA-CH `uaFullVersion` → matches UA version | ✅ |
 | `Notification.permission` ↔ `permissions.query` cross-check | ✅ consistent |
 | HTTP `Accept-Language` ↔ `navigator.languages` cross-check (wire vs JS, CDP) | ✅ consistent |
+| `Sec-CH-UA` client hints ↔ `navigator.userAgentData` cross-check (wire vs JS, CDP) | ✅ consistent |
 | `navigator.mimeTypes` include the PDF handlers (catches length-only plugin spoofs) | ✅ |
 | Media devices enumerated via `enumerateDevices` (headless shells report none) | ✅ audiooutput present |
 | Spoofed natives survive `Function.prototype.toString` (source-leak check) | ✅ |
