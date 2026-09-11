@@ -390,6 +390,120 @@ def test_stealth_init_js_syntax():
 
 
 # --------------------------------------------------------------------------
+# USER_AGENT_METADATA / apply_wire_ua — wire-level client hints (no browser)
+# --------------------------------------------------------------------------
+def test_user_agent_metadata_matches_js_spoof():
+    """The wire metadata (CDP override) must advertise exactly what the JS
+    userAgentData spoof claims — the fingerprint check's httpSecChUa
+    cross-check compares this pair, so any drift here is a live wire/JS
+    mismatch that server-side detectors probe for."""
+    from stealth_browser.browser import STEALTH_INIT, USER_AGENT_METADATA
+
+    seg = re.search(r"brands:\s*\[(.*?)\]", STEALTH_INIT, re.S).group(1)
+    js_brands = re.findall(r"brand:\s*'([^']+)',\s*version:\s*'([^']+)'", seg)
+    wire_brands = [(b["brand"], b["version"])
+                   for b in USER_AGENT_METADATA["brands"]]
+    assert wire_brands == js_brands
+
+
+def test_user_agent_metadata_matches_real_ua():
+    """Engine metadata versions must come from REAL_UA (single source of
+    truth) and agree with the spoofed profile surfaces."""
+    from stealth_browser.browser import REAL_UA, USER_AGENT_METADATA
+
+    major = re.search(r"Chrome/(\d+)\.", REAL_UA).group(1)
+    full = re.search(r"Chrome/(\d+\.\d+\.\d+\.\d+)", REAL_UA).group(1)
+    for b in USER_AGENT_METADATA["brands"]:
+        if b["brand"] != "Not)A;Brand":
+            assert b["version"] == major
+    for b in USER_AGENT_METADATA["fullVersionList"]:
+        if b["brand"] != "Not)A;Brand":
+            assert b["version"] == full
+    assert USER_AGENT_METADATA["fullVersion"] == full
+    assert USER_AGENT_METADATA["platform"] == "Linux"
+    assert USER_AGENT_METADATA["mobile"] is False
+    assert USER_AGENT_METADATA["architecture"] == "x86"
+    assert USER_AGENT_METADATA["bitness"] == "64"
+
+
+class _RecordingCDP:
+    def __init__(self):
+        self.sent = []
+        self.detached = False
+
+    def on(self, event, fn):
+        pass
+
+    async def send(self, method, params=None):
+        self.sent.append((method, params))
+
+    async def detach(self):
+        self.detached = True
+
+
+class _CdpContext:
+    def __init__(self, cdp):
+        self._cdp = cdp
+
+    async def new_cdp_session(self, page):
+        return self._cdp
+
+
+class _CdpPage:
+    def __init__(self, cdp):
+        self.context = _CdpContext(cdp)
+
+
+@pytest.mark.asyncio
+async def test_apply_wire_ua_sends_full_metadata():
+    from stealth_browser.browser import (REAL_UA, USER_AGENT_METADATA,
+                                         apply_wire_ua, _wire_ua_sessions)
+
+    page = _CdpPage(_RecordingCDP())
+    await apply_wire_ua(page)
+    cdp = page.context._cdp
+    # The browser-side override is owned by the DevTools session: the
+    # session must stay OPEN (detaching reverts the wire to the real build).
+    assert not cdp.detached
+    assert len(cdp.sent) == 1
+    method, params = cdp.sent[0]
+    assert method == "Network.setUserAgentOverride"
+    assert params["userAgent"] == REAL_UA
+    assert params["userAgentMetadata"] == USER_AGENT_METADATA
+    # Repeated calls re-assert on the SAME tracked session (idempotent).
+    assert _wire_ua_sessions.get(page) is cdp
+    await apply_wire_ua(page)
+    assert len(cdp.sent) == 2
+    _wire_ua_sessions.pop(page, None)
+
+
+@pytest.mark.asyncio
+async def test_apply_wire_ua_swallows_errors():
+    """Best effort by design: a failing CDP call (closed target, missing
+    session support) must never break the launch flow."""
+    from stealth_browser.browser import apply_wire_ua, _wire_ua_sessions
+
+    class _BrokenCDP(_RecordingCDP):
+        async def send(self, method, params=None):
+            raise RuntimeError("target closed")
+
+    page = _CdpPage(_BrokenCDP())
+    await apply_wire_ua(page)  # must not raise
+    assert not page.context._cdp.detached  # session stays open (owned)
+    _wire_ua_sessions.pop(page, None)
+
+
+@pytest.mark.asyncio
+async def test_apply_wire_ua_tolerates_missing_cdp():
+    from stealth_browser.browser import apply_wire_ua
+
+    class _NoCdpPage:
+        pass  # no .context — new_cdp_session unavailable
+
+    await apply_wire_ua(_NoCdpPage())  # must not raise
+
+
+# --------------------------------------------------------------------------
 # open_browser smoke (headless Chromium) — skip if patchright missing
 # --------------------------------------------------------------------------
 @pytest.mark.asyncio
