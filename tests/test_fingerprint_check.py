@@ -123,6 +123,12 @@ def _clean_results():
                           "videoinput": 0},
         # wire-level HTTP header (CDP probe) must agree with navigator.languages
         "httpAcceptLanguage": "zh-CN,zh;q=0.9",
+        # wire-level Sec-CH-UA client hints (CDP probe) must agree with
+        # navigator.userAgentData — the spoof above brands Chrome 149 / Linux
+        "httpSecChUa": ('"Chromium";v="149", "Google Chrome";v="149", '
+                         '"Not;A=Brand";v="99"'),
+        "httpSecChUaMobile": "?0",
+        "httpSecChUaPlatform": '"Linux"',
     }
 
 
@@ -450,6 +456,10 @@ def test_ua_platform_mismatch_is_flagged():
 def test_ua_mobile_claim_warns():
     r = _clean_results()
     r["uaDataMobile"] = True
+    # Drop the wire hint so the httpSecChUaMobile cross-check cannot run:
+    # a mobile claim WITH a wire 'not mobile' hint is a hard FAIL there
+    # (see test_sec_ch_ua_mobile_cross_check) — this test targets uaChMobile.
+    del r["httpSecChUaMobile"]
     a = analyze_report(r)
     assert a["checks"]["uaChMobile"]["status"] == "WARN"
     assert a["summary"]["verdict"] == "attention"
@@ -1233,11 +1243,19 @@ def _req_event(headers):
                         "method": "GET", "headers": headers}}
 
 
+def _probe_out(**overrides):
+    """Expected header_probe result shape: all four captured keys, defaulting
+    to None (no capture) with the given overrides filled in."""
+    out = {key: None for key in fingerprint_check._PROBE_HEADER_KEYS}
+    out.update(overrides)
+    return out
+
+
 async def test_header_probe_captures_accept_language():
     cdp = _FakeCDP([_req_event({"Accept-Language": "zh-CN,zh;q=0.9",
                                  "User-Agent": "Chrome/149"})])
     out = await header_probe(_FakePage(cdp))
-    assert out == {"httpAcceptLanguage": "zh-CN,zh;q=0.9"}
+    assert out == _probe_out(httpAcceptLanguage="zh-CN,zh;q=0.9")
     assert cdp.detached  # session always cleaned up
 
 
@@ -1245,7 +1263,7 @@ async def test_header_probe_header_casing_insensitive():
     """CDP header casing varies across versions — lowercase must match too."""
     cdp = _FakeCDP([_req_event({"accept-language": "zh-CN,zh;q=0.9"})])
     out = await header_probe(_FakePage(cdp))
-    assert out == {"httpAcceptLanguage": "zh-CN,zh;q=0.9"}
+    assert out == _probe_out(httpAcceptLanguage="zh-CN,zh;q=0.9")
 
 
 async def test_header_probe_uses_first_matching_request():
@@ -1255,7 +1273,36 @@ async def test_header_probe_uses_first_matching_request():
         _req_event({"accept-language": "en-US,en;q=0.9"}),
     ])
     out = await header_probe(_FakePage(cdp))
-    assert out == {"httpAcceptLanguage": "zh-CN,zh;q=0.9"}
+    assert out == _probe_out(httpAcceptLanguage="zh-CN,zh;q=0.9")
+
+
+async def test_header_probe_captures_sec_ch_ua_family():
+    """The default UA client hints ride the same request as Accept-Language
+    and must be snapshotted together so the wire/JS cross-checks compare
+    one coherent request (casing-insensitive, like the other headers)."""
+    cdp = _FakeCDP([_req_event({
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "sec-ch-ua": ('"Chromium";v="149", "Google Chrome";v="149", '
+                       '"Not;A=Brand";v="99"'),
+        "SEC-CH-UA-MOBILE": "?0",
+        "Sec-CH-UA-Platform": '"Linux"',
+    })])
+    out = await header_probe(_FakePage(cdp))
+    assert out == _probe_out(
+        httpAcceptLanguage="zh-CN,zh;q=0.9",
+        httpSecChUa=('"Chromium";v="149", "Google Chrome";v="149", '
+                      '"Not;A=Brand";v="99"'),
+        httpSecChUaMobile="?0",
+        httpSecChUaPlatform='"Linux"',
+    )
+
+
+async def test_header_probe_sec_ch_ua_absent_means_none():
+    """A request without the client hints (e.g. a non-secure destination)
+    records None for them — 'not sent', never a fabricated value."""
+    cdp = _FakeCDP([_req_event({"Accept-Language": "zh-CN,zh;q=0.9"})])
+    out = await header_probe(_FakePage(cdp))
+    assert out == _probe_out(httpAcceptLanguage="zh-CN,zh;q=0.9")
 
 
 async def test_header_probe_no_matching_request_returns_none(monkeypatch):
@@ -1264,13 +1311,13 @@ async def test_header_probe_no_matching_request_returns_none(monkeypatch):
     monkeypatch.setattr(fingerprint_check, "_HEADER_PROBE_TIMEOUT", 0.05)
     cdp = _FakeCDP([_req_event({"User-Agent": "Chrome/149"})])
     out = await header_probe(_FakePage(cdp))
-    assert out == {"httpAcceptLanguage": None}
+    assert out == _probe_out()
 
 
 async def test_header_probe_no_events_at_all_returns_none(monkeypatch):
     monkeypatch.setattr(fingerprint_check, "_HEADER_PROBE_TIMEOUT", 0.05)
     out = await header_probe(_FakePage(_FakeCDP([])))
-    assert out == {"httpAcceptLanguage": None}
+    assert out == _probe_out()
 
 
 async def test_header_probe_session_error_reports_err():
@@ -1282,6 +1329,133 @@ async def test_header_probe_session_error_reports_err():
 
     out = await header_probe(_NoCDPPage())
     assert out["httpAcceptLanguage"].startswith("err:")
+    assert out["httpSecChUa"].startswith("err:")
+    assert out["httpSecChUaMobile"].startswith("err:")
+    assert out["httpSecChUaPlatform"].startswith("err:")
+
+
+# --------------------------------------------------------------------------
+# analyze_report — wire-vs-JS Sec-CH-UA client-hints cross-check
+# --------------------------------------------------------------------------
+def test_sec_ch_ua_wire_matches_js_is_pass():
+    r = _clean_results()
+    a = analyze_report(r)
+    c = a["checks"]["httpSecChUa"]
+    assert c["status"] == "PASS"
+    assert "Google Chrome 149" in c["note"]
+
+
+def test_sec_ch_ua_version_mismatch_is_flagged():
+    """A UA override that leaves the engine's client hints behind (wire says
+    148, JS spoof says 149) is exactly the mismatch server-side detectors
+    probe for — and one no in-page JS check can ever see."""
+    r = _clean_results()
+    r["httpSecChUa"] = ('"Chromium";v="148", "Google Chrome";v="148", '
+                          '"Not;A=Brand";v="99"')
+    a = analyze_report(r)
+    c = a["checks"]["httpSecChUa"]
+    assert c["status"] == "FAIL"
+    assert "148 on the wire vs 149 in JS" in c["note"]
+
+
+def test_sec_ch_ua_wire_missing_chrome_brand_is_flagged():
+    """A headless-style wire hint (Chromium only, no Google Chrome) against
+    a JS spoof advertising the flagship brand — JS-only UA-CH spoof tell."""
+    r = _clean_results()
+    r["httpSecChUa"] = '"Chromium";v="149", "Not;A=Brand";v="99"'
+    a = analyze_report(r)
+    assert a["checks"]["httpSecChUa"]["status"] == "FAIL"
+
+
+def test_sec_ch_ua_grease_difference_is_not_flagged():
+    """The grease brand rotates per session ('Not;A=Brand' vs 'Not:A-Brand'
+    vs the spoof's 'Not)A;Brand') — a differing grease must stay PASS."""
+    r = _clean_results()
+    r["httpSecChUa"] = ('"Google Chrome";v="149", "Not:A-Brand";v="8", '
+                          '"Chromium";v="149"')
+    a = analyze_report(r)
+    assert a["checks"]["httpSecChUa"]["status"] == "PASS"
+
+
+def test_sec_ch_ua_missing_wire_is_warn():
+    r = _clean_results()
+    del r["httpSecChUa"]
+    a = analyze_report(r)
+    assert a["checks"]["httpSecChUa"]["status"] == "WARN"
+
+
+def test_sec_ch_ua_err_is_warn():
+    r = _clean_results()
+    r["httpSecChUa"] = "err:TargetClosedError"
+    a = analyze_report(r)
+    assert a["checks"]["httpSecChUa"]["status"] == "WARN"
+
+
+def test_sec_ch_ua_malformed_wire_is_warn():
+    r = _clean_results()
+    r["httpSecChUa"] = "garbage"
+    a = analyze_report(r)
+    assert a["checks"]["httpSecChUa"]["status"] == "WARN"
+
+
+def test_sec_ch_ua_js_brands_missing_is_warn():
+    """Without a JS-side brands snapshot the cross-check cannot run —
+    'cannot verify' (the missing userAgentData itself is flagged by
+    uaChBrands, not here)."""
+    r = _clean_results()
+    del r["uaDataBrands"]
+    a = analyze_report(r)
+    assert a["checks"]["httpSecChUa"]["status"] == "WARN"
+
+
+def test_sec_ch_ua_mobile_cross_check():
+    r = _clean_results()
+    a = analyze_report(r)
+    assert a["checks"]["httpSecChUaMobile"]["status"] == "PASS"
+    r["httpSecChUaMobile"] = "?1"  # desktop profile claiming mobile on the wire
+    a = analyze_report(r)
+    assert a["checks"]["httpSecChUaMobile"]["status"] == "FAIL"
+    r["httpSecChUaMobile"] = "bogus"
+    a = analyze_report(r)
+    assert a["checks"]["httpSecChUaMobile"]["status"] == "WARN"
+    del r["httpSecChUaMobile"]
+    a = analyze_report(r)
+    assert a["checks"]["httpSecChUaMobile"]["status"] == "WARN"
+
+
+def test_sec_ch_ua_platform_cross_check():
+    r = _clean_results()
+    a = analyze_report(r)
+    assert a["checks"]["httpSecChUaPlatform"]["status"] == "PASS"
+    r["httpSecChUaPlatform"] = '"Windows"'
+    a = analyze_report(r)
+    assert a["checks"]["httpSecChUaPlatform"]["status"] == "FAIL"
+    del r["httpSecChUaPlatform"]
+    a = analyze_report(r)
+    assert a["checks"]["httpSecChUaPlatform"]["status"] == "WARN"
+
+
+def test_sec_ch_ua_parsers():
+    parse = fingerprint_check._parse_sec_ch_ua
+    assert parse('"Chromium";v="149", "Not;A=Brand";v="99"') == [
+        ("Chromium", "149"), ("Not;A=Brand", "99")]
+    assert parse("garbage") is None
+    assert parse("") is None
+    assert parse(None) is None
+    plat = fingerprint_check._parse_sec_ch_ua_platform
+    assert plat('"Linux"') == "Linux"
+    assert plat('"Chrome OS"') == "Chrome OS"
+    assert plat("Linux") == "Linux"  # tolerate unquoted values
+    assert plat("") is None
+    brands = fingerprint_check._parse_ua_data_brands
+    assert brands('[{"brand": "Google Chrome", "version": "149"}]') == [
+        ("Google Chrome", "149")]
+    assert brands(None) is None
+    assert brands("not json") is None
+    assert brands("{}") is None
+    assert fingerprint_check._brand_mismatches(
+        [("Google Chrome", "149"), ("Chromium", "149")],
+        [("Google Chrome", "149"), ("Chromium", "149")]) == []
 
 
 # --------------------------------------------------------------------------
